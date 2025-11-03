@@ -473,26 +473,16 @@ def load_all_data(base_dir):
                         all_labels.append(label)
                         all_metadata.append(metadata)
 
-                        # Apply data augmentation if enabled
-                        if AUGMENTATION_ENABLED:
-                            for _ in range(AUGMENTATION_PER_SAMPLE):
-                                aug_profile = augment_profile(profile, AUGMENTATION_NOISE_LEVEL)
-                                all_profiles.append(aug_profile)
-                                all_labels.append(label)
-                                # Mark as augmented in metadata
-                                aug_metadata = metadata.copy()
-                                aug_metadata['augmented'] = True
-                                all_metadata.append(aug_metadata)
+                        # NOTE: Augmentation moved to AFTER train/test split
+                        # to prevent data leakage (augmented copies must not
+                        # appear in both train and test sets)
 
         except ValueError:
             print(f"  Skipping non-numeric folder: {loc_str}")
             continue
 
     print(f"\nTotal samples loaded: {len(all_profiles)}")
-    if AUGMENTATION_ENABLED:
-        orig_count = len(all_profiles) // (1 + AUGMENTATION_PER_SAMPLE)
-        aug_count = len(all_profiles) - orig_count
-        print(f"  Original: {orig_count}, Augmented: {aug_count}")
+    print(f"  Note: Augmentation will be applied after train/test split to prevent data leakage")
 
     return (np.array(all_profiles, dtype=np.float32),
             np.array(all_labels, dtype=np.float32),
@@ -784,7 +774,43 @@ if __name__ == '__main__':
     print(f"  Training set: {len(X_train_full)} samples")
     print(f"  Validation set: {len(X_val)} samples")
     print(f"  Test set: {len(X_test)} samples")
-    
+
+    # -------------------------------------------------------------------------
+    # Apply data augmentation to TRAINING SET ONLY (prevent data leakage)
+    # -------------------------------------------------------------------------
+    if AUGMENTATION_ENABLED:
+        print(f"\n  Applying data augmentation to training set...")
+        print(f"  Augmentation: {AUGMENTATION_PER_SAMPLE} copies per sample at {AUGMENTATION_NOISE_LEVEL*100}% noise")
+
+        X_train_augmented = []
+        y_train_augmented = []
+        metadata_train_augmented = []
+
+        for i, (profile, label, meta) in enumerate(zip(X_train_full, y_train, metadata_train)):
+            # Keep original
+            X_train_augmented.append(profile)
+            y_train_augmented.append(label)
+            metadata_train_augmented.append(meta)
+
+            # Create augmented copies
+            for _ in range(AUGMENTATION_PER_SAMPLE):
+                aug_profile = augment_profile(profile, AUGMENTATION_NOISE_LEVEL)
+                X_train_augmented.append(aug_profile)
+                y_train_augmented.append(label)
+
+                aug_meta = meta.copy()
+                aug_meta['augmented'] = True
+                metadata_train_augmented.append(aug_meta)
+
+        # Replace training set with augmented version
+        X_train_full = np.array(X_train_augmented, dtype=np.float32)
+        y_train = np.array(y_train_augmented, dtype=np.float32)
+        metadata_train = metadata_train_augmented
+
+        orig_count = len(X_train_full) // (1 + AUGMENTATION_PER_SAMPLE)
+        aug_count = len(X_train_full) - orig_count
+        print(f"  Training set expanded: {orig_count} → {len(X_train_full)} samples ({aug_count} augmented)")
+
     # -------------------------------------------------------------------------
     # Fit scaler on training data only
     # -------------------------------------------------------------------------
