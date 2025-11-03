@@ -48,7 +48,9 @@ FEATURE_MODE = 'optimized'  # Options: 'optimized' (no gradients), 'full' (with 
 USE_GRADIENTS = False  # Set to True to include gradients (NOT recommended - degrades performance)
 
 # Data augmentation settings
-AUGMENTATION_ENABLED = True
+# NOTE: If your data already contains synthetic noise variations (e.g., file1, file2, file3
+# are the same survey with different noise), consider disabling augmentation or setting to 0.
+AUGMENTATION_ENABLED = False  # Disabled - data already has noise variations
 AUGMENTATION_NOISE_LEVEL = 0.05  # 5% noise
 AUGMENTATION_PER_SAMPLE = 2  # Number of augmented copies per sample
 
@@ -743,37 +745,105 @@ if __name__ == '__main__':
         print(f"  {config}: {count} samples")
 
     # -------------------------------------------------------------------------
-    # Split data: Train (70%), Validation (15%), Test (15%)
-    # Stratified by target location to ensure balanced representation
+    # Split data: Group-based splitting to prevent data leakage
     # -------------------------------------------------------------------------
-    print(f"\n[2/6] Splitting data (Train/Val/Test: 70%/15%/15%)")
+    # CRITICAL: Files like "0moffset1" and "0moffset2" are the SAME survey configuration
+    # with different noise realizations. They must stay in the same split!
+    #
+    # We group by (location, config_type, offset) so all noise variations stay together.
+    # This tests: "Can the model generalize to UNSEEN survey configurations?"
+    # -------------------------------------------------------------------------
+    print(f"\n[2/6] Splitting data by configuration groups (prevents noise variation leakage)")
     print("-" * 70)
 
-    # First split: separate test set
-    X_temp, X_test, y_temp, y_test = train_test_split(
-        X, y, test_size=0.15, random_state=RANDOM_SEED, stratify=y
-    )
+    # Create configuration groups (each group = all noise variations of one survey config)
+    config_groups = {}
+    for i, meta in enumerate(metadata):
+        # Group key: (location, config_type, offset)
+        # All files with same location+config+offset are treated as one group
+        group_key = (meta['true_location'], meta['config_type'], meta['offset'])
+        if group_key not in config_groups:
+            config_groups[group_key] = []
+        config_groups[group_key].append(i)
 
-    # Second split: separate train and validation
-    X_train_full, X_val, y_train, y_val = train_test_split(
-        X_temp, y_temp, test_size=0.176, random_state=RANDOM_SEED, stratify=y_temp  # 0.176 * 0.85 ≈ 0.15
-    )
+    print(f"  Found {len(config_groups)} unique configuration groups (location+config+offset)")
+    print(f"  Group composition:")
+    for group_key, indices in sorted(config_groups.items()):
+        loc, cfg_type, offset = group_key
+        print(f"    Location={loc}m, {offset}m_{cfg_type}: {len(indices)} noise variations")
 
-    # Split metadata accordingly
-    indices_temp, indices_test = train_test_split(
-        np.arange(len(y)), test_size=0.15, random_state=RANDOM_SEED, stratify=y
-    )
-    indices_train, indices_val = train_test_split(
-        indices_temp, test_size=0.176, random_state=RANDOM_SEED, stratify=y_temp
-    )
+    # Split groups (not individual samples!)
+    # We'll manually assign groups to ensure good distribution
+    group_keys = list(config_groups.keys())
+    np.random.seed(RANDOM_SEED)
+    np.random.shuffle(group_keys)
 
-    metadata_train = [metadata[i] for i in indices_train]
-    metadata_val = [metadata[i] for i in indices_val]
-    metadata_test = [metadata[i] for i in indices_test]
+    # Assign groups to splits (aim for 60% train, 20% val, 20% test by sample count)
+    train_groups = []
+    val_groups = []
+    test_groups = []
 
-    print(f"  Training set: {len(X_train_full)} samples")
-    print(f"  Validation set: {len(X_val)} samples")
-    print(f"  Test set: {len(X_test)} samples")
+    train_count = 0
+    val_count = 0
+    test_count = 0
+    total_samples = len(y)
+
+    for group_key in group_keys:
+        group_size = len(config_groups[group_key])
+
+        # Greedy assignment to balance splits
+        if train_count < 0.6 * total_samples:
+            train_groups.append(group_key)
+            train_count += group_size
+        elif val_count < 0.2 * total_samples:
+            val_groups.append(group_key)
+            val_count += group_size
+        else:
+            test_groups.append(group_key)
+            test_count += group_size
+
+    # Create index lists for each split
+    train_indices = []
+    val_indices = []
+    test_indices = []
+
+    for group_key in train_groups:
+        train_indices.extend(config_groups[group_key])
+    for group_key in val_groups:
+        val_indices.extend(config_groups[group_key])
+    for group_key in test_groups:
+        test_indices.extend(config_groups[group_key])
+
+    # Extract data for each split
+    X_train_full = X[train_indices]
+    y_train = y[train_indices]
+    metadata_train = [metadata[i] for i in train_indices]
+
+    X_val = X[val_indices]
+    y_val = y[val_indices]
+    metadata_val = [metadata[i] for i in val_indices]
+
+    X_test = X[test_indices]
+    y_test = y[test_indices]
+    metadata_test = [metadata[i] for i in test_indices]
+
+    print(f"\n  Split allocation:")
+    print(f"    Training:   {len(train_groups)} groups → {len(X_train_full)} samples")
+    for group_key in train_groups:
+        loc, cfg_type, offset = group_key
+        print(f"      - {offset}m_{cfg_type} at {loc}m ({len(config_groups[group_key])} files)")
+
+    print(f"    Validation: {len(val_groups)} groups → {len(X_val)} samples")
+    for group_key in val_groups:
+        loc, cfg_type, offset = group_key
+        print(f"      - {offset}m_{cfg_type} at {loc}m ({len(config_groups[group_key])} files)")
+
+    print(f"    Test:       {len(test_groups)} groups → {len(X_test)} samples")
+    for group_key in test_groups:
+        loc, cfg_type, offset = group_key
+        print(f"      - {offset}m_{cfg_type} at {loc}m ({len(config_groups[group_key])} files)")
+
+    print(f"\n  ✓ No noise variation leakage: Each config group stays in one split only")
 
     # -------------------------------------------------------------------------
     # Apply data augmentation to TRAINING SET ONLY (prevent data leakage)
