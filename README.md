@@ -125,8 +125,34 @@ Outputs:
 - Raw X/Z component profiles
 - Spatial feature visualization
 
+### Feature Ablation Study (`feature_ablation_study.py`)
+Test which features contribute most to model performance:
+
+```bash
+python feature_ablation_study.py
+```
+
+Tests 8 different feature combinations:
+- **Full**: All ~100 features (baseline)
+- **Minimal**: Only late_sum_Z_residual
+- **Physics Core**: Decay ratios + key residuals
+- **No Residuals**: Raw features only
+- **No Gradients**: Excluding spatial derivatives
+- **Late Only**: Only late-time channels
+- **Ratios Only**: Only decay ratios
+- **Z Component Only**: Only vertical component
+
+Outputs:
+- `feature_ablation_results.csv` - Performance comparison
+- Identifies critical vs redundant features
+- Validates if model learns physics vs memorizes
+
+See `FEATURE_RATIONALE.md` for scientific explanation of each feature.
+
 ## Documentation
 
+- **README.md** - Project overview and quick start (this file)
+- **FEATURE_RATIONALE.md** - Scientific rationale for feature engineering
 - **IMPROVEMENTS.md** - Detailed documentation of all improvements
 - **requirements.txt** - Python package dependencies
 - **test_data_loading.py** - Quick test script to verify setup

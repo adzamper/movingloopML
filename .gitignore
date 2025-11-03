@@ -15,6 +15,9 @@ __pycache__/
 improved_training_results.png
 *.png
 
+# CSV outputs
+*.csv
+
 # Jupyter Notebook
 .ipynb_checkpoints
 
@@ -40,3 +43,7 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Output directories
+detailed_plots/
+
