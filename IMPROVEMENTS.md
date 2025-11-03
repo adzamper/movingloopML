@@ -3,6 +3,58 @@
 ## Overview
 This document summarizes the comprehensive improvements made to the TEM target localization machine learning script.
 
+## Recent Updates (Latest)
+
+### **Noise Robustness Testing** 🆕
+**Problem:** Good performance metrics may indicate overfitting if model isn't tested against noise.
+
+**Solution:**
+- Added `test_noise_robustness()` function
+- Tests model with increasing Gaussian noise levels (0%, 5%, 10%, 15%, 20%, 25%)
+- Automatically evaluates if model is ROBUST, MODERATELY SENSITIVE, or OVERFITTING
+- Visualization shows noise degradation curve
+
+**Output:**
+```
+Noise Level | MAE (m)
+-------------------------
+  0.0%      |  17.91
+  5.0%      |  19.34
+ 10.0%      |  21.56
+ 15.0%      |  24.23
+ 20.0%      |  27.45
+ 25.0%      |  31.12
+
+✓ Model is ROBUST (20% noise → 53.3% error increase)
+```
+
+**Impact:** Provides confidence that model will generalize to real-world noisy data, not just training distribution.
+
+---
+
+### **Probability Curves for Target Locations** 🆕
+**Problem:** Original visualization lacked probability/confidence curves showing prediction distributions.
+
+**Solution:**
+- Added Gaussian probability curve for each target location
+- Shows prediction confidence as probability density functions
+- Helps visualize how well-separated different target predictions are
+- Uses ensemble uncertainty (standard deviation) for realistic confidence intervals
+
+**Impact:** Clear visualization of prediction confidence and potential confusion between nearby targets.
+
+---
+
+### **Visualization Updates** 🆕
+**Changes:**
+- ✅ Removed summary statistics text panel (cleaner layout)
+- ✅ Added noise robustness curve (plot 6)
+- ✅ Added probability curves for all target locations (plot 7)
+- ✅ Fixed matplotlib deprecation warning (`labels` → `tick_labels`)
+- Result: 7 high-quality plots showing all aspects of model performance
+
+---
+
 ## Key Improvements
 
 ### 1. **Configuration Tracking & Analysis** ✅

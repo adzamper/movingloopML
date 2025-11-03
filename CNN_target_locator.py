@@ -551,6 +551,50 @@ def analyze_by_configuration(y_true, y_pred, metadata_list):
     return config_stats
 
 
+def test_noise_robustness(models, X_test, y_test, noise_levels=[0.0, 0.05, 0.1, 0.15, 0.2]):
+    """
+    Test model robustness by adding Gaussian noise at various levels.
+
+    This helps identify overfitting - a robust model should degrade gracefully
+    with increasing noise, while an overfit model will collapse.
+
+    Parameters:
+    -----------
+    models : list
+        List of trained ensemble models
+    X_test : np.array
+        Test data
+    y_test : np.array
+        Test labels
+    noise_levels : list
+        Noise standard deviations to test (as fraction of signal)
+
+    Returns:
+    --------
+    dict : Noise level -> MAE mapping
+    """
+    noise_results = {}
+
+    for noise_level in noise_levels:
+        # Add Gaussian noise to test data
+        if noise_level > 0:
+            noise = np.random.normal(0, noise_level, X_test.shape)
+            X_noisy = X_test + noise * np.abs(X_test)
+        else:
+            X_noisy = X_test
+
+        # Get ensemble predictions
+        preds = np.array([model.predict(X_noisy, verbose=0).flatten()
+                         for model in models])
+        mean_preds = np.mean(preds, axis=0)
+
+        # Calculate MAE
+        mae = np.mean(np.abs(mean_preds - y_test))
+        noise_results[noise_level] = mae
+
+    return noise_results
+
+
 # ============================================================================
 # MAIN EXECUTION
 # ============================================================================
@@ -764,6 +808,27 @@ if __name__ == '__main__':
     print(f"\n  Best Configuration: {best_config[0]} (MAE: {best_config[1]['mae']:.2f} m)")
 
     # -------------------------------------------------------------------------
+    # Noise Robustness Testing
+    # -------------------------------------------------------------------------
+    print(f"\n  Testing noise robustness...")
+    noise_levels = [0.0, 0.05, 0.1, 0.15, 0.2, 0.25]
+    noise_results = test_noise_robustness(models, X_test, y_test, noise_levels)
+
+    print(f"\n  Noise Robustness Results:")
+    print(f"    Noise Level | MAE (m)")
+    print(f"    {'-'*25}")
+    for noise_level, mae_val in noise_results.items():
+        print(f"    {noise_level*100:5.1f}%      | {mae_val:6.2f}")
+
+    degradation = (noise_results[0.2] - noise_results[0.0]) / noise_results[0.0] * 100
+    if degradation < 50:
+        print(f"\n  ✓ Model is ROBUST (20% noise → {degradation:.1f}% error increase)")
+    elif degradation < 100:
+        print(f"\n  ⚠ Model shows MODERATE sensitivity (20% noise → {degradation:.1f}% error increase)")
+    else:
+        print(f"\n  ✗ Model may be OVERFITTING (20% noise → {degradation:.1f}% error increase)")
+
+    # -------------------------------------------------------------------------
     # Visualization
     # -------------------------------------------------------------------------
     print(f"\n  Generating visualizations...")
@@ -814,7 +879,7 @@ if __name__ == '__main__':
     ax4.set_title('Performance by Configuration', fontsize=11, fontweight='bold')
     ax4.grid(True, alpha=0.3, axis='x')
 
-    # 5. Error by Configuration (boxplot)
+    # 5. Error by Configuration (boxplot) - Fixed matplotlib deprecation
     ax5 = fig.add_subplot(gs[1, 2])
     config_errors = []
     config_labels = []
@@ -827,58 +892,53 @@ if __name__ == '__main__':
             # Shorten label for readability
             config_labels.append(config.replace('_offset', '').replace('_trailing', 'T'))
 
-    ax5.boxplot(config_errors, labels=config_labels)
+    ax5.boxplot(config_errors, tick_labels=config_labels)
     ax5.set_ylabel('Absolute Error (m)', fontsize=10)
     ax5.set_title('Error Distribution by Config', fontsize=11, fontweight='bold')
     ax5.tick_params(axis='x', rotation=45, labelsize=8)
     ax5.grid(True, alpha=0.3, axis='y')
 
-    # 6. Predictions by True Location
+    # 6. Noise Robustness
     ax6 = fig.add_subplot(gs[2, 0])
-    unique_locs = sorted(set(y_test))
-    loc_maes = [np.mean([errors[i] for i in range(len(y_test)) if y_test[i] == loc])
-               for loc in unique_locs]
-    ax6.plot(unique_locs, loc_maes, 'o-', linewidth=2, markersize=8)
-    ax6.set_xlabel('True Target Location (m)', fontsize=10)
+    noise_x = [n*100 for n in noise_levels]
+    noise_y = [noise_results[n] for n in noise_levels]
+    ax6.plot(noise_x, noise_y, 'o-', linewidth=2, markersize=8, color='red')
+    ax6.axhline(mae, color='green', linestyle='--', linewidth=1.5, alpha=0.7, label='Baseline MAE')
+    ax6.set_xlabel('Noise Level (%)', fontsize=10)
     ax6.set_ylabel('Mean Absolute Error (m)', fontsize=10)
-    ax6.set_title('Error by Target Location', fontsize=11, fontweight='bold')
+    ax6.set_title('Noise Robustness Test', fontsize=11, fontweight='bold')
+    ax6.legend()
     ax6.grid(True, alpha=0.3)
 
-    # 7. Uncertainty Distribution
-    ax7 = fig.add_subplot(gs[2, 1])
-    ax7.hist(std_preds, bins=30, edgecolor='black', alpha=0.7, color='orange')
-    ax7.axvline(np.mean(std_preds), color='r', linestyle='--', linewidth=2,
-               label=f'Mean = {np.mean(std_preds):.1f}m')
-    ax7.set_xlabel('Prediction Uncertainty (σ, m)', fontsize=10)
-    ax7.set_ylabel('Frequency', fontsize=10)
-    ax7.set_title('Uncertainty Distribution', fontsize=11, fontweight='bold')
-    ax7.legend()
-    ax7.grid(True, alpha=0.3, axis='y')
+    # 7. Prediction Probability Curves for Each Target Location
+    ax7 = fig.add_subplot(gs[2, 1:])
+    unique_locs = sorted(set(y_test))
+    colors_loc = plt.cm.tab10(np.linspace(0, 1, len(unique_locs)))
 
-    # 8. Summary Statistics Text
-    ax8 = fig.add_subplot(gs[2, 2])
-    ax8.axis('off')
-    summary_text = f"""
-    SUMMARY STATISTICS
-    {'='*30}
+    for idx, true_loc in enumerate(unique_locs):
+        # Get all predictions for this target location
+        loc_preds = [mean_preds[i] for i in range(len(y_test)) if y_test[i] == true_loc]
+        loc_stds = [std_preds[i] for i in range(len(y_test)) if y_test[i] == true_loc]
 
-    Test Set: {len(y_test)} samples
+        if loc_preds:
+            # Create probability/confidence curve
+            mean_pred = np.mean(loc_preds)
+            mean_std = np.mean(loc_stds)
 
-    Performance:
-      • MAE: {mae:.2f} m
-      • Median Error: {median_error:.2f} m
-      • RMSE: {rmse:.2f} m
-      • Mean Uncertainty: {np.mean(std_preds):.2f} m
+            # Plot Gaussian distribution around prediction
+            x_range = np.linspace(true_loc - 200, true_loc + 200, 100)
+            y_range = (1 / (mean_std * np.sqrt(2 * np.pi))) * \
+                      np.exp(-0.5 * ((x_range - mean_pred) / mean_std) ** 2)
 
-    Best Configuration:
-      • {best_config[0]}
-      • MAE: {best_config[1]['mae']:.2f} m
+            ax7.plot(x_range, y_range, linewidth=2, label=f'Target @ {int(true_loc)}m',
+                    color=colors_loc[idx])
+            ax7.axvline(true_loc, color=colors_loc[idx], linestyle='--', alpha=0.3, linewidth=1)
 
-    Models: {N_ENSEMBLE} ensemble members
-    Features: {X.shape[2]} per station
-    """
-    ax8.text(0.1, 0.5, summary_text, fontsize=9, family='monospace',
-            verticalalignment='center')
+    ax7.set_xlabel('Predicted Location (m)', fontsize=10)
+    ax7.set_ylabel('Probability Density', fontsize=10)
+    ax7.set_title('Prediction Probability Curves by Target Location', fontsize=11, fontweight='bold')
+    ax7.legend(fontsize=8, ncol=2)
+    ax7.grid(True, alpha=0.3)
 
     plt.suptitle('TEM Target Locator - Comprehensive Results', fontsize=14, fontweight='bold')
     plt.savefig('improved_training_results.png', dpi=200, bbox_inches='tight')
@@ -894,6 +954,13 @@ if __name__ == '__main__':
     print(f"    • Models: improved_model_0.keras to improved_model_{N_ENSEMBLE-1}.keras")
     print(f"    • Scaler: {SCALER_PATH}")
     print(f"    • Results plot: improved_training_results.png")
-    print(f"\n  Final Test MAE: {mae:.2f} m")
-    print(f"  Best configuration: {best_config[0]} (MAE: {best_config[1]['mae']:.2f} m)")
+    print(f"\n  Performance Summary:")
+    print(f"    • Test MAE: {mae:.2f} m")
+    print(f"    • Best configuration: {best_config[0]} (MAE: {best_config[1]['mae']:.2f} m)")
+    print(f"    • Noise robustness: {degradation:.1f}% error increase at 20% noise")
+    print(f"\n  Visualization includes:")
+    print(f"    • Prediction accuracy plots")
+    print(f"    • Configuration comparison")
+    print(f"    • Noise robustness curve")
+    print(f"    • Probability curves for each target location")
     print("="*70)
