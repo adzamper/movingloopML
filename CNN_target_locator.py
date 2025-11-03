@@ -945,22 +945,92 @@ if __name__ == '__main__':
     plt.close()
 
     # -------------------------------------------------------------------------
+    # Export Results to CSV for Detailed Analysis
+    # -------------------------------------------------------------------------
+    print(f"\n  Exporting results to CSV files...")
+
+    # 1. Main predictions CSV
+    results_df = pd.DataFrame({
+        'true_location': y_test,
+        'predicted_location': mean_preds,
+        'absolute_error': errors,
+        'ensemble_uncertainty': std_preds,
+        'offset': [metadata_test[i]['offset'] for i in range(len(y_test))],
+        'config_type': [metadata_test[i]['config_type'] for i in range(len(y_test))],
+        'file_id': [metadata_test[i]['file_id'] for i in range(len(y_test))]
+    })
+    results_df.to_csv('predictions_results.csv', index=False)
+
+    # 2. Configuration performance CSV
+    config_perf_df = pd.DataFrame([
+        {
+            'configuration': config,
+            'n_samples': stats['n_samples'],
+            'mae': stats['mae'],
+            'median_error': stats['median_error'],
+            'std': stats['std'],
+            'max_error': stats['max_error']
+        }
+        for config, stats in config_stats.items()
+    ])
+    config_perf_df.to_csv('configuration_performance.csv', index=False)
+
+    # 3. Noise robustness CSV
+    noise_df = pd.DataFrame([
+        {'noise_level_percent': n*100, 'mae': noise_results[n]}
+        for n in noise_levels
+    ])
+    noise_df.to_csv('noise_robustness.csv', index=False)
+
+    # 4. Individual model predictions (for ensemble analysis)
+    individual_preds_df = pd.DataFrame(test_preds.T, columns=[f'model_{i}' for i in range(N_ENSEMBLE)])
+    individual_preds_df['true_location'] = y_test
+    individual_preds_df['ensemble_mean'] = mean_preds
+    individual_preds_df['ensemble_std'] = std_preds
+    individual_preds_df.to_csv('ensemble_predictions.csv', index=False)
+
+    # 5. Test set metadata with predictions (for detailed profiling)
+    detailed_results = []
+    for i in range(len(y_test)):
+        detailed_results.append({
+            'sample_idx': i,
+            'true_location': y_test[i],
+            'predicted_location': mean_preds[i],
+            'error': errors[i],
+            'uncertainty': std_preds[i],
+            'offset': metadata_test[i]['offset'],
+            'config_type': metadata_test[i]['config_type'],
+            'file_id': metadata_test[i]['file_id'],
+            'augmented': metadata_test[i].get('augmented', False)
+        })
+    detailed_df = pd.DataFrame(detailed_results)
+    detailed_df.to_csv('detailed_test_results.csv', index=False)
+
+    print(f"    ✓ Exported 5 CSV files for detailed analysis")
+
+    # -------------------------------------------------------------------------
     # Final Summary
     # -------------------------------------------------------------------------
     print("\n" + "="*70)
     print("TRAINING COMPLETE!")
     print("="*70)
     print(f"\n  Saved files:")
-    print(f"    • Models: improved_model_0.keras to improved_model_{N_ENSEMBLE-1}.keras")
-    print(f"    • Scaler: {SCALER_PATH}")
-    print(f"    • Results plot: improved_training_results.png")
+    print(f"    Models:")
+    print(f"      • improved_model_0.keras to improved_model_{N_ENSEMBLE-1}.keras")
+    print(f"      • {SCALER_PATH}")
+    print(f"    Visualization:")
+    print(f"      • improved_training_results.png")
+    print(f"    CSV Data (for custom analysis):")
+    print(f"      • predictions_results.csv")
+    print(f"      • configuration_performance.csv")
+    print(f"      • noise_robustness.csv")
+    print(f"      • ensemble_predictions.csv")
+    print(f"      • detailed_test_results.csv")
     print(f"\n  Performance Summary:")
     print(f"    • Test MAE: {mae:.2f} m")
     print(f"    • Best configuration: {best_config[0]} (MAE: {best_config[1]['mae']:.2f} m)")
     print(f"    • Noise robustness: {degradation:.1f}% error increase at 20% noise")
-    print(f"\n  Visualization includes:")
-    print(f"    • Prediction accuracy plots")
-    print(f"    • Configuration comparison")
-    print(f"    • Noise robustness curve")
-    print(f"    • Probability curves for each target location")
+    print(f"\n  Next steps:")
+    print(f"    • Run 'python visualize_results.py' for detailed profile plots")
+    print(f"    • Run 'python predict_single.py <path_to_tem_file>' for single predictions")
     print("="*70)

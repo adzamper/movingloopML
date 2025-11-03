@@ -55,9 +55,19 @@ Each folder represents a target location. Each `.tem` file contains survey data 
 
 After training, you'll get:
 
-- **Models:** `improved_model_0.keras`, `improved_model_1.keras`, etc.
-- **Scaler:** `improved_scaler.joblib` (for feature normalization)
-- **Results plot:** `improved_training_results.png` (comprehensive 8-plot analysis)
+**Models:**
+- `improved_model_0.keras`, `improved_model_1.keras`, etc.
+- `improved_scaler.joblib` (for feature normalization)
+
+**Visualizations:**
+- `improved_training_results.png` (7-plot comprehensive analysis)
+
+**CSV Data Files (for custom analysis):**
+- `predictions_results.csv` - All test predictions with errors and uncertainty
+- `configuration_performance.csv` - Performance metrics by configuration
+- `noise_robustness.csv` - Noise sensitivity test results
+- `ensemble_predictions.csv` - Individual model predictions for analysis
+- `detailed_test_results.csv` - Complete test set metadata with predictions
 
 ## Performance Metrics
 
@@ -78,6 +88,42 @@ N_ENSEMBLE = 3                    # Number of ensemble models
 AUGMENTATION_ENABLED = True       # Enable data augmentation
 AUGMENTATION_NOISE_LEVEL = 0.05   # 5% noise augmentation
 ```
+
+## Additional Tools
+
+### Detailed Visualization (`visualize_results.py`)
+Generate detailed individual plots from exported CSV files:
+
+```bash
+python visualize_results.py
+```
+
+Creates 6 detailed plots in `detailed_plots/` folder:
+1. Error heatmap by configuration and location
+2. Ensemble agreement analysis
+3. Per-configuration performance comparison
+4. Worst 12 predictions analysis
+5. Best 12 predictions analysis
+6. Augmentation impact (if applicable)
+
+### Single File Prediction (`predict_single.py`)
+Predict target location for a single unseen .tem file with probability curve:
+
+```bash
+python predict_single.py <path_to_tem_file>
+```
+
+Example:
+```bash
+python predict_single.py 1700/0moffset1.tem
+```
+
+Outputs:
+- Ensemble prediction with uncertainty
+- Probability distribution curve
+- Individual model predictions
+- Raw X/Z component profiles
+- Spatial feature visualization
 
 ## Documentation
 
