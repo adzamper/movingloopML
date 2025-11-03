@@ -1,0 +1,42 @@
+# Python bytecode and cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# ML model files (large binary files)
+*.keras
+*.h5
+*.joblib
+*.pkl
+*.pickle
+
+# Training outputs
+improved_training_results.png
+*.png
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDE settings
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Data files (if large)
+*.tem
+
+# Logs
+*.log
