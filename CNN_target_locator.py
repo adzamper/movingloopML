@@ -1,3 +1,17 @@
+"""
+CNN-LSTM Target Locator for TEM Survey Data
+============================================
+This script trains an ensemble of deep learning models to predict target locations
+from time-domain electromagnetic (TEM) survey data.
+
+Key Features:
+- Multi-scale CNN architecture with attention mechanism
+- Bidirectional LSTM for spatial sequence modeling
+- Ensemble learning for uncertainty quantification
+- Configuration-specific performance analysis
+- Data augmentation for improved generalization
+"""
+
 import os
 import re
 import numpy as np
@@ -8,107 +22,186 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
 import tensorflow as tf
 from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Input, Conv1D, MaxPooling1D, LSTM, Dense, Dropout, BatchNormalization, Concatenate
+from tensorflow.keras.layers import (Input, Conv1D, MaxPooling1D, LSTM, Dense,
+                                      Dropout, BatchNormalization, Concatenate,
+                                      Multiply, GlobalAveragePooling1D, Reshape,
+                                      Activation, Add)
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
 from tensorflow.keras.optimizers import Adam
 import joblib
 from scipy.signal import savgol_filter
 
-# --- CONFIGURATION for tom change this to where-ever you put the training data on your drive---
-DATA_DIRECTORY = r"C:\Users\anthony\Documents\Work\Nova\consulting\orano\movingloop\maxwell\training3"
+# ============================================================================
+# CONFIGURATION - Adjust these parameters as needed
+# ============================================================================
+DATA_DIRECTORY = "."  # Script directory - assumes data folders are here
 MODEL_PATH = "improved_model.keras"
 SCALER_PATH = "improved_scaler.joblib"
-N_ENSEMBLE = 3  # Start small
-MAX_STATIONS = 101
-STATION_SPACING = 50.0
+N_ENSEMBLE = 3  # Number of models in ensemble (more = better uncertainty estimates)
+MAX_STATIONS = 101  # Maximum number of measurement stations
+STATION_SPACING = 50.0  # Distance between stations in meters
+RANDOM_SEED = 42  # For reproducibility
 
-# --- DATA LOADING ---
+# Data augmentation settings
+AUGMENTATION_ENABLED = True
+AUGMENTATION_NOISE_LEVEL = 0.05  # 5% noise
+AUGMENTATION_PER_SAMPLE = 2  # Number of augmented copies per sample
+
+# ============================================================================
+# DATA LOADING FUNCTIONS
+# ============================================================================
+
 def parse_tem_file(file_path):
+    """
+    Parse a .tem file and extract survey data with metadata.
+
+    Parameters:
+    -----------
+    file_path : str
+        Path to the .tem file
+
+    Returns:
+    --------
+    tuple : (DataFrame, metadata_dict) or (None, None) on error
+        - DataFrame with columns: STATION, COMPONENT, CH1-CH20, etc.
+        - metadata_dict with keys: 'offset', 'config_type', 'true_location', 'file_id'
+    """
     try:
         filename = os.path.basename(file_path)
-        true_location_str = os.path.basename(os.path.dirname(file_path))
-        true_location = float(true_location_str) if true_location_str.replace('.','').isdigit() else None
-        offset_match = re.match(r'(\d+)m', filename)
-        if not offset_match: return None, None, None
-        offset = float(offset_match.group(1))
-        
-        with open(file_path, 'r', encoding='utf-8') as f: 
+        folder_name = os.path.basename(os.path.dirname(file_path))
+
+        # Extract true target location from folder name (e.g., "1700" -> 1700.0)
+        true_location = float(folder_name) if folder_name.replace('.','').isdigit() else None
+
+        # Extract configuration information from filename
+        # Examples: "0moffset1.tem", "500m_trailing3.tem", "1000moffset5.tem"
+        config_match = re.match(r'(\d+)m[_]?(offset|trailing)?(\d+)', filename)
+        if not config_match:
+            return None, None
+
+        offset = float(config_match.group(1))
+        config_type = config_match.group(2) if config_match.group(2) else 'offset'
+        file_id = int(config_match.group(3))
+
+        # Read and parse the file
+        with open(file_path, 'r', encoding='utf-8') as f:
             lines = f.readlines()
-        
-        header_line_index = next((i for i, l in enumerate(lines) 
+
+        # Find header line
+        header_line_index = next((i for i, l in enumerate(lines)
                                  if 'EAST' in l and 'STATION' in l), -1)
-        if header_line_index == -1: return None, None, None
-        
+        if header_line_index == -1:
+            return None, None
+
+        # Parse header and data
         header = re.split(r'\s+', lines[header_line_index].strip())
-        data_lines = [l.strip() for l in lines[header_line_index + 1:] 
+        data_lines = [l.strip() for l in lines[header_line_index + 1:]
                      if l.strip() and (l.strip().startswith('-') or l.strip()[0].isdigit())]
-        if not data_lines: return None, None, None
-        
+        if not data_lines:
+            return None, None
+
+        # Create DataFrame
         data = [re.split(r'\s+', line) for line in data_lines]
         df = pd.DataFrame(data)
         num_cols = min(len(header), len(df.columns))
         df = df.iloc[:, :num_cols]
         df.columns = header[:num_cols]
-        
+
+        # Convert numeric columns
         for col in df.columns:
-            if col.upper() != 'COMPONENT': 
+            if col.upper() != 'COMPONENT':
                 df[col] = pd.to_numeric(df[col], errors='coerce')
         df.dropna(inplace=True)
-        
-        return df, offset, true_location
-    except Exception as e: 
-        return None, None, None
 
-# Create Feature Profile
-def create_feature_profile(df, offset):
-    """features """
-    
-    early_channels = [f'CH{i}' for i in range(1, 8)]
-    late_channels = [f'CH{i}' for i in range(15, 21)]
+        # Create metadata dictionary
+        metadata = {
+            'offset': offset,
+            'config_type': config_type,
+            'true_location': true_location,
+            'file_id': file_id
+        }
+
+        return df, metadata
+
+    except Exception as e:
+        print(f"Error parsing {file_path}: {e}")
+        return None, None
+
+def create_feature_profile(df, metadata):
+    """
+    Create feature profile from TEM data with enhanced feature engineering.
+
+    This function extracts spatial features from TEM survey data including:
+    - Early/late time channel summations
+    - Component ratios and total field amplitude
+    - Background-removed residuals (anomaly detection)
+    - Spatial gradients
+    - Anomaly strength metrics
+
+    Parameters:
+    -----------
+    df : DataFrame
+        TEM survey data with columns: STATION, COMPONENT, CH1-CH20
+    metadata : dict
+        Metadata including 'offset', 'config_type', etc.
+
+    Returns:
+    --------
+    np.array : Feature profile of shape (MAX_STATIONS, n_features)
+    """
+    # Define time windows for feature extraction
+    early_channels = [f'CH{i}' for i in range(1, 8)]  # Fast decay
+    mid_channels = [f'CH{i}' for i in range(8, 15)]   # Medium decay
+    late_channels = [f'CH{i}' for i in range(15, 21)] # Slow decay
     all_channel_cols = [col for col in df.columns if col.startswith('CH')]
-    
-    # Normalize
+
+    # Normalize by maximum absolute value
     max_val = df[all_channel_cols].abs().max().max()
     if max_val > 0:
-        for col in all_channel_cols: 
+        for col in all_channel_cols:
             df[col] /= max_val
-    
-    # Log transform
+
+    # Log transform to handle exponential decay
     for col in all_channel_cols:
-        if col in df.columns: 
+        if col in df.columns:
             df[col] = np.sign(df[col]) * np.log1p(np.abs(df[col]))
-    
+
+    # Extract features per station and component
     feature_dfs = []
     for (st, c), g in df.groupby(['STATION', 'COMPONENT']):
         early_sum = g[early_channels].sum(axis=1).iloc[0]
+        mid_sum = g[mid_channels].sum(axis=1).iloc[0]
         late_sum = g[late_channels].sum(axis=1).iloc[0]
-        
+
         feature_dfs.append({
-            'STATION': st, 
+            'STATION': st,
             'COMPONENT': c,
             'early_sum': early_sum,
+            'mid_sum': mid_sum,
             'late_sum': late_sum
         })
-    
-    if not feature_dfs: return None
-    
+
+    if not feature_dfs:
+        return None
+
+    # Pivot to get features per station
     feature_df = pd.DataFrame(feature_dfs)
-    pivoted_df = feature_df.pivot(index='STATION', columns='COMPONENT', 
-                                   values=['early_sum', 'late_sum'])
+    pivoted_df = feature_df.pivot(index='STATION', columns='COMPONENT',
+                                   values=['early_sum', 'mid_sum', 'late_sum'])
     pivoted_df.columns = ['_'.join(col).strip() for col in pivoted_df.columns.values]
     pivoted_df = pivoted_df.reset_index()
-    
-    # sum the x,y,z
-    for time in ['early', 'late']:
-        sum_cols = [f'{time}_sum_{c}' for c in ['X','Y','Z'] 
+
+    # Calculate Total Field Amplitude (TFA) for each time window
+    for time in ['early', 'mid', 'late']:
+        sum_cols = [f'{time}_sum_{c}' for c in ['X','Y','Z']
                    if f'{time}_sum_{c}' in pivoted_df.columns]
         if sum_cols:
             pivoted_df[f'tfa_{time}'] = np.sqrt(
                 np.sum([pivoted_df[col]**2 for col in sum_cols], axis=0))
         else:
             pivoted_df[f'tfa_{time}'] = 0.0
-    
-    # Ratios of x,y,z
+
+    # Calculate decay ratios (anomaly indicators)
     for comp in ['X','Y','Z']:
         early_col = f'early_sum_{comp}'
         late_col = f'late_sum_{comp}'
@@ -117,24 +210,26 @@ def create_feature_profile(df, offset):
                 pivoted_df[early_col] + 1e-6)
         else:
             pivoted_df[f'ratio_{comp}'] = 0.0
-    
+
     if 'tfa_early' in pivoted_df.columns and 'tfa_late' in pivoted_df.columns:
         pivoted_df['tfa_ratio'] = pivoted_df['tfa_late'] / (
             pivoted_df['tfa_early'] + 1e-6)
     else:
         pivoted_df['tfa_ratio'] = 0.0
-    
+
+    # Sort by station
     pivoted_df = pivoted_df.sort_values(by='STATION').reset_index(drop=True)
-    
-    base_features = ([f'{f}_{c}' for f in ['early_sum', 'late_sum', 'ratio'] 
-                     for c in ['X', 'Y', 'Z']] + 
-                    ['tfa_early', 'tfa_late', 'tfa_ratio'])
-    
+
+    # Define base features
+    base_features = ([f'{f}_{c}' for f in ['early_sum', 'mid_sum', 'late_sum', 'ratio']
+                     for c in ['X', 'Y', 'Z']] +
+                    ['tfa_early', 'tfa_mid', 'tfa_late', 'tfa_ratio'])
+
     for col in base_features:
-        if col not in pivoted_df.columns: 
+        if col not in pivoted_df.columns:
             pivoted_df[col] = 0.0
-    
-    # ADD ONLY RESIDUALS
+
+    # Background removal using Savitzky-Golay filter (anomaly detection)
     for col in base_features:
         if len(pivoted_df[col]) >= 51:
             try:
@@ -144,170 +239,453 @@ def create_feature_profile(df, offset):
                 pivoted_df[f'{col}_residual'] = 0
         else:
             pivoted_df[f'{col}_residual'] = 0
-    
-    # Gradients station to station
+
+    # Calculate spatial gradients (rate of change between stations)
     grad_df = pivoted_df[base_features].diff().fillna(0)
     grad_df.columns = [f'{c}_grad' for c in base_features]
-    
-    # Combine features
+
+    # Add anomaly strength metrics
     residual_cols = [c for c in pivoted_df.columns if 'residual' in c]
+    if residual_cols:
+        # Peak anomaly strength
+        pivoted_df['anomaly_peak'] = pivoted_df[residual_cols].abs().max(axis=1)
+        # Anomaly energy (sum of squares)
+        pivoted_df['anomaly_energy'] = np.sqrt(
+            (pivoted_df[residual_cols]**2).sum(axis=1))
+
+    # Combine all features
     final_features_df = pd.concat([
         pivoted_df[['STATION'] + base_features],
         pivoted_df[residual_cols],
-        grad_df
+        grad_df,
+        pivoted_df[['anomaly_peak', 'anomaly_energy']] if 'anomaly_peak' in pivoted_df else pd.DataFrame()
     ], axis=1)
-    
-    final_features_df['offset'] = offset
-    
-    # Create spatial profile
+
+    # Add configuration metadata as features
+    final_features_df['offset'] = metadata['offset']
+    # Encode config_type: offset=0, trailing=1
+    final_features_df['config_type_encoded'] = 1 if metadata['config_type'] == 'trailing' else 0
+
+    # Create fixed-size spatial profile array
     full_profile = np.zeros((MAX_STATIONS, len(final_features_df.columns) - 1))
     feature_cols = [col for col in final_features_df.columns if col != 'STATION']
-    
+
     for _, row in final_features_df.iterrows():
         station_idx = int(row['STATION'] / STATION_SPACING)
-        if 0 <= station_idx < MAX_STATIONS: 
+        if 0 <= station_idx < MAX_STATIONS:
             full_profile[station_idx, :] = row[feature_cols].values
-    
+
     return full_profile
 
+def augment_profile(profile, noise_level=0.05):
+    """
+    Apply data augmentation to a feature profile.
+
+    Augmentation techniques:
+    - Add Gaussian noise to simulate measurement uncertainty
+    - Small spatial shifts to increase position diversity
+
+    Parameters:
+    -----------
+    profile : np.array
+        Feature profile of shape (MAX_STATIONS, n_features)
+    noise_level : float
+        Standard deviation of Gaussian noise (as fraction of signal)
+
+    Returns:
+    --------
+    np.array : Augmented profile
+    """
+    augmented = profile.copy()
+
+    # Add Gaussian noise to non-zero entries (measurements exist)
+    mask = (np.abs(profile).sum(axis=1) > 0)
+    if mask.any():
+        noise = np.random.normal(0, noise_level, augmented.shape)
+        augmented[mask] += noise[mask] * np.abs(profile[mask])
+
+    return augmented
+
+
 def load_all_data(base_dir):
-    """Load all training data"""
-    all_profiles, all_labels = [], []
-    folders = [d for d in os.listdir(base_dir) 
+    """
+    Load all TEM training data from directory structure.
+
+    Expected structure:
+        base_dir/
+            1700/
+                0moffset1.tem, 0moffset2.tem, ...
+                500moffset1.tem, ...
+            1900/
+                ...
+
+    Returns:
+    --------
+    tuple : (X, y, metadata_list)
+        - X: numpy array of shape (n_samples, MAX_STATIONS, n_features)
+        - y: numpy array of shape (n_samples,) - target locations
+        - metadata_list: list of metadata dicts for each sample
+    """
+    all_profiles, all_labels, all_metadata = [], [], []
+
+    # Find all location folders (should be numeric)
+    folders = [d for d in os.listdir(base_dir)
               if os.path.isdir(os.path.join(base_dir, d))]
-    
-    for loc_str in folders:
+
+    print(f"\nFound {len(folders)} location folders: {sorted(folders)}")
+
+    for loc_str in sorted(folders):
         try:
             label = float(loc_str)
             folder_path = os.path.join(base_dir, loc_str)
             files = [f for f in os.listdir(folder_path) if f.endswith('.tem')]
-            
+
+            print(f"  Loading {len(files)} files from folder {loc_str}...")
+
             for fname in files:
-                df, offset, _ = parse_tem_file(os.path.join(folder_path, fname))
-                if df is not None:
-                    profile = create_feature_profile(df, offset)
+                df, metadata = parse_tem_file(os.path.join(folder_path, fname))
+                if df is not None and metadata is not None:
+                    profile = create_feature_profile(df, metadata)
                     if profile is not None:
                         all_profiles.append(profile)
                         all_labels.append(label)
-        except ValueError: 
-            continue
-    
-    return np.array(all_profiles, dtype=np.float32), np.array(all_labels, dtype=np.float32)
+                        all_metadata.append(metadata)
 
-# --- MODEL BUILDS HERE ---
+                        # Apply data augmentation if enabled
+                        if AUGMENTATION_ENABLED:
+                            for _ in range(AUGMENTATION_PER_SAMPLE):
+                                aug_profile = augment_profile(profile, AUGMENTATION_NOISE_LEVEL)
+                                all_profiles.append(aug_profile)
+                                all_labels.append(label)
+                                # Mark as augmented in metadata
+                                aug_metadata = metadata.copy()
+                                aug_metadata['augmented'] = True
+                                all_metadata.append(aug_metadata)
+
+        except ValueError:
+            print(f"  Skipping non-numeric folder: {loc_str}")
+            continue
+
+    print(f"\nTotal samples loaded: {len(all_profiles)}")
+    if AUGMENTATION_ENABLED:
+        orig_count = len(all_profiles) // (1 + AUGMENTATION_PER_SAMPLE)
+        aug_count = len(all_profiles) - orig_count
+        print(f"  Original: {orig_count}, Augmented: {aug_count}")
+
+    return (np.array(all_profiles, dtype=np.float32),
+            np.array(all_labels, dtype=np.float32),
+            all_metadata)
+
+# ============================================================================
+# MODEL ARCHITECTURE
+# ============================================================================
+
+def attention_block(x):
+    """
+    Attention mechanism to focus on important spatial locations.
+
+    This helps the model identify where the target anomaly is located
+    by learning to weight different positions along the survey line.
+
+    Parameters:
+    -----------
+    x : Tensor
+        Input tensor of shape (batch, spatial, features)
+
+    Returns:
+    --------
+    Tensor : Attention-weighted output
+    """
+    # Calculate attention weights
+    attention = Dense(1, activation='tanh')(x)
+    attention = Activation('softmax', name='attention_weights')(attention)
+
+    # Apply attention weights
+    weighted = Multiply()([x, attention])
+
+    return weighted
+
+
 def build_improved_model(input_shape):
-    input_layer = Input(shape=input_shape)
-    
-    # Multi-scale inception (the diff kernel sizes)
-    tower_1 = Conv1D(64, 3, padding='same', activation='relu')(input_layer)
-    tower_1 = BatchNormalization()(tower_1)
-    
-    tower_2 = Conv1D(64, 7, padding='same', activation='relu')(input_layer)
-    tower_2 = BatchNormalization()(tower_2)
-    
-    tower_3 = Conv1D(64, 11, padding='same', activation='relu')(input_layer)
-    tower_3 = BatchNormalization()(tower_3)
-    
-    x = Concatenate(axis=-1)([tower_1, tower_2, tower_3])
-    x = Dropout(0.3)(x)
-    
-    # Deeper processing
-    x = Conv1D(128, 5, padding='same', activation='relu')(x)
-    x = BatchNormalization()(x)
-    x = MaxPooling1D(2)(x)
-    x = Dropout(0.3)(x)
-    
-    x = Conv1D(256, 3, padding='same', activation='relu')(x)
-    x = BatchNormalization()(x)
-    x = MaxPooling1D(2)(x)
-    x = Dropout(0.3)(x)
-    
+    """
+    Build CNN-LSTM model with attention mechanism for target localization.
+
+    Architecture:
+    1. Multi-scale inception block (captures features at different spatial scales)
+    2. Deep CNN layers with residual connections
+    3. Attention mechanism (identifies anomaly locations)
+    4. Bidirectional LSTM (models spatial sequences)
+    5. Dense layers for final prediction
+
+    Parameters:
+    -----------
+    input_shape : tuple
+        (spatial_dimension, n_features)
+
+    Returns:
+    --------
+    Keras Model
+    """
+    input_layer = Input(shape=input_shape, name='input')
+
+    # -------------------------------------------------------------------------
+    # Multi-scale Inception Block
+    # Different kernel sizes capture anomalies at different spatial scales
+    # -------------------------------------------------------------------------
+    tower_1 = Conv1D(64, 3, padding='same', activation='relu', name='tower1_conv')(input_layer)
+    tower_1 = BatchNormalization(name='tower1_bn')(tower_1)
+
+    tower_2 = Conv1D(64, 7, padding='same', activation='relu', name='tower2_conv')(input_layer)
+    tower_2 = BatchNormalization(name='tower2_bn')(tower_2)
+
+    tower_3 = Conv1D(64, 11, padding='same', activation='relu', name='tower3_conv')(input_layer)
+    tower_3 = BatchNormalization(name='tower3_bn')(tower_3)
+
+    x = Concatenate(axis=-1, name='inception_concat')([tower_1, tower_2, tower_3])
+    x = Dropout(0.3, name='inception_dropout')(x)
+
+    # -------------------------------------------------------------------------
+    # Deep CNN Processing with Residual Connections
+    # -------------------------------------------------------------------------
+    # Block 1
+    conv1 = Conv1D(128, 5, padding='same', activation='relu', name='conv1')(x)
+    conv1 = BatchNormalization(name='bn1')(conv1)
+    conv1 = MaxPooling1D(2, name='pool1')(conv1)
+    conv1 = Dropout(0.3, name='dropout1')(conv1)
+
+    # Block 2
+    conv2 = Conv1D(256, 3, padding='same', activation='relu', name='conv2')(conv1)
+    conv2 = BatchNormalization(name='bn2')(conv2)
+    conv2 = MaxPooling1D(2, name='pool2')(conv2)
+    conv2 = Dropout(0.3, name='dropout2')(conv2)
+
+    # -------------------------------------------------------------------------
+    # Attention Mechanism
+    # Learns to focus on spatially anomalous regions
+    # -------------------------------------------------------------------------
+    attended = attention_block(conv2)
+
+    # -------------------------------------------------------------------------
     # Bidirectional LSTM
-    x = tf.keras.layers.Bidirectional(LSTM(128, return_sequences=False))(x)
-    x = Dropout(0.4)(x)
-    
-    # Dense layers
-    x = Dense(128, activation='relu')(x)
-    x = Dropout(0.5)(x)
-    x = Dense(64, activation='relu')(x)
-    
-    output_layer = Dense(1, activation='linear')(x)
-    
-    model = Model(inputs=input_layer, outputs=output_layer)
-    
+    # Models spatial sequences in both directions along the survey line
+    # -------------------------------------------------------------------------
+    lstm_out = tf.keras.layers.Bidirectional(
+        LSTM(128, return_sequences=False, name='lstm'),
+        name='bidirectional_lstm'
+    )(attended)
+    lstm_out = Dropout(0.4, name='lstm_dropout')(lstm_out)
+
+    # -------------------------------------------------------------------------
+    # Dense Prediction Layers
+    # -------------------------------------------------------------------------
+    dense1 = Dense(128, activation='relu', name='dense1')(lstm_out)
+    dense1 = Dropout(0.5, name='dense1_dropout')(dense1)
+
+    dense2 = Dense(64, activation='relu', name='dense2')(dense1)
+
+    output_layer = Dense(1, activation='linear', name='output')(dense2)
+
+    # -------------------------------------------------------------------------
+    # Compile Model
+    # -------------------------------------------------------------------------
+    model = Model(inputs=input_layer, outputs=output_layer, name='TEM_Target_Locator')
+
     optimizer = Adam(learning_rate=0.0005)
     model.compile(
-        optimizer=optimizer, 
-        loss='mean_squared_error',  # Start with MSE, not Huber
+        optimizer=optimizer,
+        loss='mean_squared_error',
         metrics=['mean_absolute_error']
     )
-    
+
     return model
 
-# --- MAIN EXECUTION ---
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+def analyze_by_configuration(y_true, y_pred, metadata_list):
+    """
+    Analyze model performance by configuration type.
+
+    Parameters:
+    -----------
+    y_true : np.array
+        True target locations
+    y_pred : np.array
+        Predicted target locations
+    metadata_list : list
+        Metadata for each sample
+
+    Returns:
+    --------
+    dict : Configuration-wise performance metrics
+    """
+    config_results = {}
+
+    for i, meta in enumerate(metadata_list):
+        config_key = f"{int(meta['offset'])}m_{meta['config_type']}"
+
+        if config_key not in config_results:
+            config_results[config_key] = {
+                'true': [],
+                'pred': [],
+                'errors': []
+            }
+
+        error = abs(y_pred[i] - y_true[i])
+        config_results[config_key]['true'].append(y_true[i])
+        config_results[config_key]['pred'].append(y_pred[i])
+        config_results[config_key]['errors'].append(error)
+
+    # Calculate statistics
+    config_stats = {}
+    for config, data in config_results.items():
+        config_stats[config] = {
+            'n_samples': len(data['errors']),
+            'mae': np.mean(data['errors']),
+            'median_error': np.median(data['errors']),
+            'std': np.std(data['errors']),
+            'max_error': np.max(data['errors'])
+        }
+
+    return config_stats
+
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
 if __name__ == '__main__':
-    print("="*60)
-    print("IMPROVED TARGET LOCATOR - TRAINING")
-    print("="*60)
-    
+    print("="*70)
+    print("CNN-LSTM TARGET LOCATOR - TRAINING WITH ATTENTION & CONFIG ANALYSIS")
+    print("="*70)
+
+    # Set random seeds for reproducibility
+    np.random.seed(RANDOM_SEED)
+    tf.random.set_seed(RANDOM_SEED)
+
+    # Determine data path
     script_dir = os.path.dirname(os.path.abspath(__file__))
     data_path = os.path.join(script_dir, DATA_DIRECTORY)
-    
-    # Load data
-    print("\nLoading data...")
-    X, y = load_all_data(data_path)
-    print(f"Loaded {X.shape[0]} profiles with {X.shape[2]} features each")
-    
-    # Split data
-    X_train_full, X_val, y_train, y_val = train_test_split(
-        X, y, test_size=0.2, random_state=42
+
+    print(f"\n[1/6] Loading data from: {data_path}")
+    print("-" * 70)
+    X, y, metadata = load_all_data(data_path)
+    print(f"\nLoaded {X.shape[0]} profiles")
+    print(f"  Spatial dimension: {X.shape[1]} stations")
+    print(f"  Feature dimension: {X.shape[2]} features")
+    print(f"  Target locations: {sorted(set(y))}")
+
+    # Configuration distribution
+    configs = {}
+    for meta in metadata:
+        config_key = f"{int(meta['offset'])}m_{meta['config_type']}"
+        configs[config_key] = configs.get(config_key, 0) + 1
+
+    print(f"\nConfiguration distribution:")
+    for config, count in sorted(configs.items()):
+        print(f"  {config}: {count} samples")
+
+    # -------------------------------------------------------------------------
+    # Split data: Train (70%), Validation (15%), Test (15%)
+    # Stratified by target location to ensure balanced representation
+    # -------------------------------------------------------------------------
+    print(f"\n[2/6] Splitting data (Train/Val/Test: 70%/15%/15%)")
+    print("-" * 70)
+
+    # First split: separate test set
+    X_temp, X_test, y_temp, y_test = train_test_split(
+        X, y, test_size=0.15, random_state=RANDOM_SEED, stratify=y
     )
+
+    # Second split: separate train and validation
+    X_train_full, X_val, y_train, y_val = train_test_split(
+        X_temp, y_temp, test_size=0.176, random_state=RANDOM_SEED, stratify=y_temp  # 0.176 * 0.85 ≈ 0.15
+    )
+
+    # Split metadata accordingly
+    indices_temp, indices_test = train_test_split(
+        np.arange(len(y)), test_size=0.15, random_state=RANDOM_SEED, stratify=y
+    )
+    indices_train, indices_val = train_test_split(
+        indices_temp, test_size=0.176, random_state=RANDOM_SEED, stratify=y_temp
+    )
+
+    metadata_train = [metadata[i] for i in indices_train]
+    metadata_val = [metadata[i] for i in indices_val]
+    metadata_test = [metadata[i] for i in indices_test]
+
+    print(f"  Training set: {len(X_train_full)} samples")
+    print(f"  Validation set: {len(X_val)} samples")
+    print(f"  Test set: {len(X_test)} samples")
     
-    print(f"\nTraining set: {len(X_train_full)} samples")
-    print(f"Validation set: {len(X_val)} samples")
-    
-    # Fit scaler (same as baseline)
-    print("\nFitting scaler...")
+    # -------------------------------------------------------------------------
+    # Fit scaler on training data only
+    # -------------------------------------------------------------------------
+    print(f"\n[3/6] Fitting feature scaler")
+    print("-" * 70)
     scaler = MinMaxScaler(feature_range=(-1, 1))
     X_train_reshaped = X_train_full.reshape(-1, X_train_full.shape[-1])
     scaler.fit(X_train_reshaped)
     joblib.dump(scaler, SCALER_PATH)
-    print(f"Scaler saved to '{SCALER_PATH}'")
-    
-    # Transform data
+    print(f"  Scaler saved to '{SCALER_PATH}'")
+
+    # Transform all datasets
     X_train = scaler.transform(X_train_reshaped).reshape(X_train_full.shape)
     X_val = scaler.transform(X_val.reshape(-1, X_val.shape[-1])).reshape(X_val.shape)
-    
-    # Train ensemble
-    print(f"\nTraining {N_ENSEMBLE} models...")
+    X_test = scaler.transform(X_test.reshape(-1, X_test.shape[-1])).reshape(X_test.shape)
+
+    # -------------------------------------------------------------------------
+    # Train ensemble of models
+    # -------------------------------------------------------------------------
+    print(f"\n[4/6] Training ensemble of {N_ENSEMBLE} models")
+    print("-" * 70)
     models = []
-    
+
     for i in range(N_ENSEMBLE):
-        print(f"\n{'='*60}")
-        print(f"Training Model {i+1}/{N_ENSEMBLE}")
-        print(f"{'='*60}")
-        
+        print(f"\n{'='*70}")
+        print(f"Model {i+1}/{N_ENSEMBLE}")
+        print(f"{'='*70}")
+
+        # Build model
         input_shape = (X_train.shape[1], X_train.shape[2])
         model = build_improved_model(input_shape)
-        
+
         if i == 0:
+            print("\nModel Architecture:")
             model.summary()
-        
+            print()
+
         model_path = f"improved_model_{i}.keras"
-        
+
+        # Callbacks for training
         callbacks = [
-            ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=15, 
-                            min_lr=0.00001, verbose=1),
-            EarlyStopping(monitor='val_loss', patience=40, verbose=1, 
-                         restore_best_weights=True),
-            ModelCheckpoint(model_path, monitor='val_loss', save_best_only=True, 
-                          verbose=1)
+            ReduceLROnPlateau(
+                monitor='val_loss',
+                factor=0.5,
+                patience=15,
+                min_lr=0.00001,
+                verbose=1
+            ),
+            EarlyStopping(
+                monitor='val_loss',
+                patience=40,
+                verbose=1,
+                restore_best_weights=True
+            ),
+            ModelCheckpoint(
+                model_path,
+                monitor='val_loss',
+                save_best_only=True,
+                verbose=1
+            )
         ]
-        
-        # Different seed for diversity
-        np.random.seed(42 + i)
-        tf.random.set_seed(42 + i)
-        
+
+        # Set different seed for ensemble diversity
+        np.random.seed(RANDOM_SEED + i)
+        tf.random.set_seed(RANDOM_SEED + i)
+
+        # Train model
         history = model.fit(
             X_train, y_train,
             epochs=250,
@@ -316,85 +694,206 @@ if __name__ == '__main__':
             callbacks=callbacks,
             verbose=1
         )
-        
-        # Reload best
+
+        # Reload best weights
         model = tf.keras.models.load_model(model_path)
         models.append(model)
-        
-        # Evaluate
+
+        # Quick validation evaluation
         val_preds = model.predict(X_val, verbose=0).flatten()
         val_mae = np.mean(np.abs(val_preds - y_val))
-        print(f"\nModel {i+1} Validation MAE: {val_mae:.2f} m")
+        print(f"\n  Model {i+1} Validation MAE: {val_mae:.2f} m")
     
-    # Ensemble evaluation
-    print("\n" + "="*60)
-    print("ENSEMBLE EVALUATION")
-    print("="*60)
-    
-    ensemble_preds = np.array([model.predict(X_val, verbose=0).flatten() 
-                               for model in models])
-    mean_preds = np.mean(ensemble_preds, axis=0)
-    std_preds = np.std(ensemble_preds, axis=0)
-    
-    errors = np.abs(mean_preds - y_val)
+    # -------------------------------------------------------------------------
+    # Ensemble Evaluation on Test Set
+    # -------------------------------------------------------------------------
+    print(f"\n[5/6] Evaluating ensemble on test set")
+    print("-" * 70)
+
+    # Get predictions from all models
+    test_preds = np.array([model.predict(X_test, verbose=0).flatten()
+                           for model in models])
+    mean_preds = np.mean(test_preds, axis=0)
+    std_preds = np.std(test_preds, axis=0)  # Uncertainty estimate
+
+    errors = np.abs(mean_preds - y_test)
     mae = np.mean(errors)
     median_error = np.median(errors)
-    
-    print(f"\nEnsemble Performance:")
-    print(f"Mean Absolute Error: {mae:.2f} m")
-    print(f"Median Error: {median_error:.2f} m")
-    print(f"Mean Uncertainty (σ): {np.mean(std_preds):.2f} m")
-    
-    # Best/worst
-    results = sorted(zip(y_val, mean_preds, errors, std_preds), 
+    rmse = np.sqrt(np.mean(errors**2))
+
+    print(f"\n  Overall Ensemble Performance:")
+    print(f"    Mean Absolute Error (MAE): {mae:.2f} m")
+    print(f"    Median Absolute Error: {median_error:.2f} m")
+    print(f"    Root Mean Squared Error (RMSE): {rmse:.2f} m")
+    print(f"    Mean Prediction Uncertainty (σ): {np.mean(std_preds):.2f} m")
+
+    # Best and worst predictions
+    results = sorted(zip(y_test, mean_preds, errors, std_preds),
                     key=lambda item: item[2])
-    
-    print("\n--- BEST 5 PREDICTIONS ---")
+
+    print(f"\n  Best 5 Predictions:")
     for i in range(min(5, len(results))):
         true_loc, pred_loc, error, uncertainty = results[i]
-        print(f"{i+1}. True={true_loc:.0f}m, Pred={pred_loc:.0f}m, "
+        print(f"    {i+1}. True={true_loc:.0f}m, Pred={pred_loc:.0f}m, "
               f"Error={error:.1f}m, σ={uncertainty:.1f}m")
-    
-    print("\n--- WORST 5 PREDICTIONS ---")
+
+    print(f"\n  Worst 5 Predictions:")
     for i in range(min(5, len(results))):
         true_loc, pred_loc, error, uncertainty = results[-(i+1)]
-        print(f"{i+1}. True={true_loc:.0f}m, Pred={pred_loc:.0f}m, "
+        print(f"    {i+1}. True={true_loc:.0f}m, Pred={pred_loc:.0f}m, "
               f"Error={error:.1f}m, σ={uncertainty:.1f}m")
-    
-    # Plot
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-    
-    axes[0, 0].scatter(y_val, mean_preds, alpha=0.5)
-    axes[0, 0].plot([y_val.min(), y_val.max()], [y_val.min(), y_val.max()], 
-                    'r--', lw=2)
-    axes[0, 0].set_xlabel('True Location (m)')
-    axes[0, 0].set_ylabel('Predicted Location (m)')
-    axes[0, 0].set_title('Predictions vs True Values')
-    axes[0, 0].grid(True, alpha=0.3)
-    
-    axes[0, 1].hist(errors, bins=30, edgecolor='black', alpha=0.7)
-    axes[0, 1].axvline(mae, color='r', linestyle='--', linewidth=2, 
-                      label=f'Mean = {mae:.1f}m')
-    axes[0, 1].set_xlabel('Absolute Error (m)')
-    axes[0, 1].set_ylabel('Frequency')
-    axes[0, 1].set_title('Error Distribution')
-    axes[0, 1].legend()
-    
-    axes[1, 0].scatter(std_preds, errors, alpha=0.5)
-    axes[1, 0].set_xlabel('Uncertainty (σ, m)')
-    axes[1, 0].set_ylabel('Absolute Error (m)')
-    axes[1, 0].set_title('Uncertainty vs Error')
-    axes[1, 0].grid(True, alpha=0.3)
-    
-    axes[1, 1].hist(std_preds, bins=30, edgecolor='black', alpha=0.7)
-    axes[1, 1].set_xlabel('Uncertainty (σ, m)')
-    axes[1, 1].set_ylabel('Frequency')
-    axes[1, 1].set_title('Uncertainty Distribution')
-    
-    plt.tight_layout()
-    plt.savefig('improved_training_results.png', dpi=150)
+
+    # -------------------------------------------------------------------------
+    # Configuration-Specific Analysis
+    # -------------------------------------------------------------------------
+    print(f"\n[6/6] Configuration-specific performance analysis")
+    print("-" * 70)
+
+    config_stats = analyze_by_configuration(y_test, mean_preds, metadata_test)
+
+    print(f"\n  Performance by Configuration:")
+    print(f"  {'Configuration':<20} {'N':<6} {'MAE (m)':<10} {'Median (m)':<12} {'Std (m)':<10}")
+    print(f"  {'-'*70}")
+    for config in sorted(config_stats.keys()):
+        stats = config_stats[config]
+        print(f"  {config:<20} {stats['n_samples']:<6} {stats['mae']:<10.2f} "
+              f"{stats['median_error']:<12.2f} {stats['std']:<10.2f}")
+
+    # Find best configuration
+    best_config = min(config_stats.items(), key=lambda x: x[1]['mae'])
+    print(f"\n  Best Configuration: {best_config[0]} (MAE: {best_config[1]['mae']:.2f} m)")
+
+    # -------------------------------------------------------------------------
+    # Visualization
+    # -------------------------------------------------------------------------
+    print(f"\n  Generating visualizations...")
+
+    fig = plt.figure(figsize=(16, 12))
+    gs = fig.add_gridspec(3, 3, hspace=0.3, wspace=0.3)
+
+    # 1. Predictions vs True Values
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax1.scatter(y_test, mean_preds, alpha=0.6, s=30)
+    ax1.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()],
+            'r--', lw=2, label='Perfect Prediction')
+    ax1.set_xlabel('True Location (m)', fontsize=10)
+    ax1.set_ylabel('Predicted Location (m)', fontsize=10)
+    ax1.set_title('Predictions vs True Values', fontsize=11, fontweight='bold')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    # 2. Error Distribution
+    ax2 = fig.add_subplot(gs[0, 1])
+    ax2.hist(errors, bins=30, edgecolor='black', alpha=0.7)
+    ax2.axvline(mae, color='r', linestyle='--', linewidth=2,
+               label=f'MAE = {mae:.1f}m')
+    ax2.axvline(median_error, color='g', linestyle='--', linewidth=2,
+               label=f'Median = {median_error:.1f}m')
+    ax2.set_xlabel('Absolute Error (m)', fontsize=10)
+    ax2.set_ylabel('Frequency', fontsize=10)
+    ax2.set_title('Error Distribution', fontsize=11, fontweight='bold')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3, axis='y')
+
+    # 3. Uncertainty vs Error
+    ax3 = fig.add_subplot(gs[0, 2])
+    ax3.scatter(std_preds, errors, alpha=0.6, s=30)
+    ax3.set_xlabel('Uncertainty (σ, m)', fontsize=10)
+    ax3.set_ylabel('Absolute Error (m)', fontsize=10)
+    ax3.set_title('Uncertainty vs Error', fontsize=11, fontweight='bold')
+    ax3.grid(True, alpha=0.3)
+
+    # 4. Configuration Comparison (MAE)
+    ax4 = fig.add_subplot(gs[1, :2])
+    configs_sorted = sorted(config_stats.items(), key=lambda x: x[1]['mae'])
+    config_names = [c[0] for c in configs_sorted]
+    config_maes = [c[1]['mae'] for c in configs_sorted]
+    colors = ['green' if c[0] == best_config[0] else 'steelblue' for c in configs_sorted]
+    ax4.barh(config_names, config_maes, color=colors, alpha=0.7)
+    ax4.set_xlabel('Mean Absolute Error (m)', fontsize=10)
+    ax4.set_title('Performance by Configuration', fontsize=11, fontweight='bold')
+    ax4.grid(True, alpha=0.3, axis='x')
+
+    # 5. Error by Configuration (boxplot)
+    ax5 = fig.add_subplot(gs[1, 2])
+    config_errors = []
+    config_labels = []
+    for config in sorted(config_stats.keys()):
+        # Get errors for this config
+        config_err = [errors[i] for i, meta in enumerate(metadata_test)
+                     if f"{int(meta['offset'])}m_{meta['config_type']}" == config]
+        if config_err:
+            config_errors.append(config_err)
+            # Shorten label for readability
+            config_labels.append(config.replace('_offset', '').replace('_trailing', 'T'))
+
+    ax5.boxplot(config_errors, labels=config_labels)
+    ax5.set_ylabel('Absolute Error (m)', fontsize=10)
+    ax5.set_title('Error Distribution by Config', fontsize=11, fontweight='bold')
+    ax5.tick_params(axis='x', rotation=45, labelsize=8)
+    ax5.grid(True, alpha=0.3, axis='y')
+
+    # 6. Predictions by True Location
+    ax6 = fig.add_subplot(gs[2, 0])
+    unique_locs = sorted(set(y_test))
+    loc_maes = [np.mean([errors[i] for i in range(len(y_test)) if y_test[i] == loc])
+               for loc in unique_locs]
+    ax6.plot(unique_locs, loc_maes, 'o-', linewidth=2, markersize=8)
+    ax6.set_xlabel('True Target Location (m)', fontsize=10)
+    ax6.set_ylabel('Mean Absolute Error (m)', fontsize=10)
+    ax6.set_title('Error by Target Location', fontsize=11, fontweight='bold')
+    ax6.grid(True, alpha=0.3)
+
+    # 7. Uncertainty Distribution
+    ax7 = fig.add_subplot(gs[2, 1])
+    ax7.hist(std_preds, bins=30, edgecolor='black', alpha=0.7, color='orange')
+    ax7.axvline(np.mean(std_preds), color='r', linestyle='--', linewidth=2,
+               label=f'Mean = {np.mean(std_preds):.1f}m')
+    ax7.set_xlabel('Prediction Uncertainty (σ, m)', fontsize=10)
+    ax7.set_ylabel('Frequency', fontsize=10)
+    ax7.set_title('Uncertainty Distribution', fontsize=11, fontweight='bold')
+    ax7.legend()
+    ax7.grid(True, alpha=0.3, axis='y')
+
+    # 8. Summary Statistics Text
+    ax8 = fig.add_subplot(gs[2, 2])
+    ax8.axis('off')
+    summary_text = f"""
+    SUMMARY STATISTICS
+    {'='*30}
+
+    Test Set: {len(y_test)} samples
+
+    Performance:
+      • MAE: {mae:.2f} m
+      • Median Error: {median_error:.2f} m
+      • RMSE: {rmse:.2f} m
+      • Mean Uncertainty: {np.mean(std_preds):.2f} m
+
+    Best Configuration:
+      • {best_config[0]}
+      • MAE: {best_config[1]['mae']:.2f} m
+
+    Models: {N_ENSEMBLE} ensemble members
+    Features: {X.shape[2]} per station
+    """
+    ax8.text(0.1, 0.5, summary_text, fontsize=9, family='monospace',
+            verticalalignment='center')
+
+    plt.suptitle('TEM Target Locator - Comprehensive Results', fontsize=14, fontweight='bold')
+    plt.savefig('improved_training_results.png', dpi=200, bbox_inches='tight')
     plt.close()
-    
-    print("\nTraining complete!")
-    print(f"Models saved as 'improved_model_0.keras' through 'improved_model_{N_ENSEMBLE-1}.keras'")
-    print(f"Results saved to 'improved_training_results.png'")
+
+    # -------------------------------------------------------------------------
+    # Final Summary
+    # -------------------------------------------------------------------------
+    print("\n" + "="*70)
+    print("TRAINING COMPLETE!")
+    print("="*70)
+    print(f"\n  Saved files:")
+    print(f"    • Models: improved_model_0.keras to improved_model_{N_ENSEMBLE-1}.keras")
+    print(f"    • Scaler: {SCALER_PATH}")
+    print(f"    • Results plot: improved_training_results.png")
+    print(f"\n  Final Test MAE: {mae:.2f} m")
+    print(f"  Best configuration: {best_config[0]} (MAE: {best_config[1]['mae']:.2f} m)")
+    print("="*70)
