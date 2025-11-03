@@ -5,10 +5,8 @@ Feature Ablation Study for TEM Target Locator
 Systematically test different feature combinations to understand
 which features contribute most to model performance.
 
-This helps answer:
-- Which features are critical vs redundant?
-- Is the model learning physics or memorizing patterns?
-- Can we simplify the model for better interpretability?
+This version uses the FULL model architecture (not simplified) for
+accurate comparison, but with reduced ensemble (1 model vs 3).
 
 Usage:
     python feature_ablation_study.py
@@ -22,7 +20,10 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
 import tensorflow as tf
 from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Input, Conv1D, LSTM, Dense, Dropout
+from tensorflow.keras.layers import (Input, Conv1D, MaxPooling1D, LSTM, Dense,
+                                      Dropout, BatchNormalization, Concatenate,
+                                      Multiply, Activation)
+from tensorflow.keras.callbacks import EarlyStopping
 from tensorflow.keras.optimizers import Adam
 from scipy.signal import savgol_filter
 
@@ -31,6 +32,8 @@ from CNN_target_locator import parse_tem_file, load_all_data, MAX_STATIONS, STAT
 
 # Configuration
 RANDOM_SEED = 42
+EPOCHS = 100  # Reduced from 250 for speed
+BATCH_SIZE = 32
 np.random.seed(RANDOM_SEED)
 tf.random.set_seed(RANDOM_SEED)
 
@@ -272,27 +275,71 @@ def load_data_custom(base_dir, feature_set='full'):
             all_metadata)
 
 
-def build_simple_model(input_shape):
-    """Simpler model for faster ablation testing."""
+def attention_block(x):
+    """Attention mechanism (same as main model)."""
+    attention = Dense(1, activation='tanh')(x)
+    attention = Activation('softmax', name='attention_weights')(attention)
+    weighted = Multiply()([x, attention])
+    return weighted
+
+
+def build_full_model(input_shape):
+    """
+    Full model architecture (same as main training script).
+    Uses same architecture for fair comparison.
+    """
     input_layer = Input(shape=input_shape, name='input')
 
-    # Single CNN layer
-    x = Conv1D(64, 7, padding='same', activation='relu')(input_layer)
-    x = Dropout(0.3)(x)
+    # Multi-scale Inception Block
+    tower_1 = Conv1D(64, 3, padding='same', activation='relu', name='tower1_conv')(input_layer)
+    tower_1 = BatchNormalization(name='tower1_bn')(tower_1)
 
-    # LSTM
-    x = LSTM(64, return_sequences=False)(x)
-    x = Dropout(0.4)(x)
+    tower_2 = Conv1D(64, 7, padding='same', activation='relu', name='tower2_conv')(input_layer)
+    tower_2 = BatchNormalization(name='tower2_bn')(tower_2)
 
-    # Dense
-    x = Dense(32, activation='relu')(x)
-    output_layer = Dense(1, activation='linear', name='output')(x)
+    tower_3 = Conv1D(64, 11, padding='same', activation='relu', name='tower3_conv')(input_layer)
+    tower_3 = BatchNormalization(name='tower3_bn')(tower_3)
 
-    model = Model(inputs=input_layer, outputs=output_layer, name='Ablation_Model')
+    x = Concatenate(axis=-1, name='inception_concat')([tower_1, tower_2, tower_3])
+    x = Dropout(0.3, name='inception_dropout')(x)
 
-    optimizer = Adam(learning_rate=0.001)
-    model.compile(optimizer=optimizer, loss='mean_squared_error',
-                 metrics=['mean_absolute_error'])
+    # Deep CNN Processing
+    conv1 = Conv1D(128, 5, padding='same', activation='relu', name='conv1')(x)
+    conv1 = BatchNormalization(name='bn1')(conv1)
+    conv1 = MaxPooling1D(2, name='pool1')(conv1)
+    conv1 = Dropout(0.3, name='dropout1')(conv1)
+
+    conv2 = Conv1D(256, 3, padding='same', activation='relu', name='conv2')(conv1)
+    conv2 = BatchNormalization(name='bn2')(conv2)
+    conv2 = MaxPooling1D(2, name='pool2')(conv2)
+    conv2 = Dropout(0.3, name='dropout2')(conv2)
+
+    # Attention Mechanism
+    attended = attention_block(conv2)
+
+    # Bidirectional LSTM
+    lstm_out = tf.keras.layers.Bidirectional(
+        LSTM(128, return_sequences=False, name='lstm'),
+        name='bidirectional_lstm'
+    )(attended)
+    lstm_out = Dropout(0.4, name='lstm_dropout')(lstm_out)
+
+    # Dense Prediction Layers
+    dense1 = Dense(128, activation='relu', name='dense1')(lstm_out)
+    dense1 = Dropout(0.5, name='dense1_dropout')(dense1)
+
+    dense2 = Dense(64, activation='relu', name='dense2')(dense1)
+
+    output_layer = Dense(1, activation='linear', name='output')(dense2)
+
+    model = Model(inputs=input_layer, outputs=output_layer, name='Ablation_Full_Model')
+
+    optimizer = Adam(learning_rate=0.0005)
+    model.compile(
+        optimizer=optimizer,
+        loss='mean_squared_error',
+        metrics=['mean_absolute_error']
+    )
 
     return model
 
@@ -305,17 +352,28 @@ def test_feature_set(feature_set_name, X_train, y_train, X_val, y_val, X_test, y
     print(f"  Feature shape: {X_train.shape}")
     print(f"  Number of features: {X_train.shape[2]}")
 
-    # Build model
+    # Build model (full architecture)
     input_shape = (X_train.shape[1], X_train.shape[2])
-    model = build_simple_model(input_shape)
+    model = build_full_model(input_shape)
 
-    # Train (fewer epochs for ablation study)
-    print(f"  Training...")
+    # Callbacks
+    callbacks = [
+        EarlyStopping(
+            monitor='val_loss',
+            patience=20,
+            verbose=0,
+            restore_best_weights=True
+        )
+    ]
+
+    # Train
+    print(f"  Training (max {EPOCHS} epochs with early stopping)...")
     history = model.fit(
         X_train, y_train,
-        epochs=50,  # Reduced for speed
-        batch_size=32,
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
         validation_data=(X_val, y_val),
+        callbacks=callbacks,
         verbose=0
     )
 
@@ -323,9 +381,14 @@ def test_feature_set(feature_set_name, X_train, y_train, X_val, y_val, X_test, y
     test_preds = model.predict(X_test, verbose=0).flatten()
     test_mae = np.mean(np.abs(test_preds - y_test))
 
+    val_mae = np.min(history.history['val_mean_absolute_error'])
+    epochs_trained = len(history.history['loss'])
+
+    print(f"  ✓ Trained for {epochs_trained} epochs")
+    print(f"  ✓ Val MAE: {val_mae:.2f} m")
     print(f"  ✓ Test MAE: {test_mae:.2f} m")
 
-    return test_mae, X_train.shape[2]
+    return test_mae, X_train.shape[2], val_mae
 
 
 def main():
@@ -381,13 +444,14 @@ def main():
         X_test_scaled = scaler.transform(X_test.reshape(-1, X_test.shape[-1])).reshape(X_test.shape)
 
         # Train and evaluate
-        mae, n_features = test_feature_set(
+        mae, n_features, val_mae = test_feature_set(
             feature_set, X_train_scaled, y_train,
             X_val_scaled, y_val, X_test_scaled, y_test
         )
 
         results[feature_set] = {
             'mae': mae,
+            'val_mae': val_mae,
             'n_features': n_features,
             'description': description
         }
@@ -396,70 +460,137 @@ def main():
     # Summary
     # ========================================================================
     print("\n" + "="*70)
-    print("ABLATION STUDY RESULTS")
+    print("ABLATION STUDY RESULTS (Using Full Model Architecture)")
     print("="*70)
 
-    # Sort by MAE
+    if 'full' not in results:
+        print("\n✗ Error: 'full' feature set not found in results")
+        return
+
+    baseline_mae = results['full']['mae']
+
+    # Sort by MAE (best first)
     sorted_results = sorted(results.items(), key=lambda x: x[1]['mae'])
 
-    print(f"\n{'Feature Set':<20} {'N Features':<12} {'MAE (m)':<10} {'vs Full':<10} Description")
-    print("-"*100)
-
-    baseline_mae = results.get('full', {}).get('mae', 0)
+    print(f"\n{'Feature Set':<20} {'N Feat':<8} {'Val MAE':<10} {'Test MAE':<10} {'Δ vs Full':<12} Description")
+    print("-"*120)
 
     for feature_set, data in sorted_results:
-        vs_full = ((data['mae'] - baseline_mae) / baseline_mae * 100) if baseline_mae > 0 else 0
-        vs_full_str = f"+{vs_full:.1f}%" if vs_full > 0 else f"{vs_full:.1f}%"
+        # Calculate difference: positive = worse, negative = better
+        mae_diff = data['mae'] - baseline_mae
+        diff_pct = (mae_diff / baseline_mae * 100) if baseline_mae > 0 else 0
 
-        print(f"{feature_set:<20} {data['n_features']:<12} {data['mae']:<10.2f} "
-              f"{vs_full_str:<10} {data['description']}")
+        # Format the difference string
+        if abs(mae_diff) < 0.5:
+            diff_str = "~same"
+        elif mae_diff > 0:
+            diff_str = f"+{mae_diff:.1f}m (+{diff_pct:.1f}%)"
+        else:
+            diff_str = f"{mae_diff:.1f}m ({diff_pct:.1f}%)"
+
+        # Highlight the full model
+        marker = "→" if feature_set == 'full' else " "
+
+        print(f"{marker} {feature_set:<18} {data['n_features']:<8} {data.get('val_mae', 0):<10.2f} "
+              f"{data['mae']:<10.2f} {diff_str:<12} {data['description']}")
 
     # Analysis
     print(f"\n{'='*70}")
     print("KEY FINDINGS:")
     print(f"{'='*70}")
 
-    # Find best simple model
+    print(f"\nBaseline (Full Model): {baseline_mae:.2f} m with {results['full']['n_features']} features")
+
+    # Find best simplified model
     simple_models = {k: v for k, v in results.items()
-                    if k not in ['full'] and v['n_features'] < 20}
+                    if k not in ['full'] and v['n_features'] < 30}
     if simple_models:
         best_simple = min(simple_models.items(), key=lambda x: x[1]['mae'])
-        print(f"\nBest Simple Model: {best_simple[0]}")
-        print(f"  MAE: {best_simple[1]['mae']:.2f} m ({best_simple[1]['n_features']} features)")
-        print(f"  Performance: {(baseline_mae - best_simple[1]['mae'])/baseline_mae*100:.1f}% of full model")
+        mae_diff = best_simple[1]['mae'] - baseline_mae
+        perf_retention = (1 - mae_diff / baseline_mae) * 100 if baseline_mae > 0 else 0
+
+        print(f"\nBest Simplified Model: {best_simple[0]}")
+        print(f"  • Test MAE: {best_simple[1]['mae']:.2f} m")
+        print(f"  • Features: {best_simple[1]['n_features']} (vs {results['full']['n_features']} in full)")
+        print(f"  • Performance: {perf_retention:.1f}% of full model retained")
+        if perf_retention >= 95:
+            print(f"  → EXCELLENT: Can simplify with minimal performance loss!")
+        elif perf_retention >= 90:
+            print(f"  → GOOD: Reasonable simplification possible")
+        else:
+            print(f"  → CAUTION: Significant performance drop with simplification")
 
     # Check if residuals matter
     if 'no_residuals' in results:
         residual_impact = results['no_residuals']['mae'] - baseline_mae
-        print(f"\nResiduals (background removal) impact: +{residual_impact:.2f}m error if removed")
+        residual_pct = (residual_impact / baseline_mae * 100) if baseline_mae > 0 else 0
+
+        print(f"\nBackground Removal (Residuals):")
+        print(f"  • Impact if removed: +{residual_impact:.2f} m (+{residual_pct:.1f}%)")
         if residual_impact > 5:
-            print("  → CRITICAL: Residuals are essential!")
+            print(f"  → CRITICAL: Residuals are essential for anomaly detection!")
+        elif residual_impact > 2:
+            print(f"  → IMPORTANT: Residuals help performance")
         else:
-            print("  → Residuals have modest impact")
+            print(f"  → MODEST: Residuals have small impact")
 
     # Check if gradients matter
     if 'no_gradients' in results:
         gradient_impact = results['no_gradients']['mae'] - baseline_mae
-        print(f"\nSpatial gradients impact: +{gradient_impact:.2f}m error if removed")
+        gradient_pct = (gradient_impact / baseline_mae * 100) if baseline_mae > 0 else 0
+
+        print(f"\nSpatial Gradients:")
+        print(f"  • Impact if removed: +{gradient_impact:.2f} m (+{gradient_pct:.1f}%)")
         if gradient_impact > 5:
-            print("  → IMPORTANT: Gradients help localization")
+            print(f"  → CRITICAL: Gradients essential for localization!")
+        elif gradient_impact > 2:
+            print(f"  → IMPORTANT: Gradients help localization")
         else:
-            print("  → Gradients have modest impact")
+            print(f"  → MODEST: Gradients have small impact")
+
+    # Physics-based features
+    if 'ratios_only' in results:
+        ratios_impact = results['ratios_only']['mae'] - baseline_mae
+        print(f"\nDecay Ratios (Physics-Based):")
+        print(f"  • MAE with ONLY ratios: {results['ratios_only']['mae']:.2f} m")
+        print(f"  • Impact: +{ratios_impact:.2f} m vs full model")
+        if results['ratios_only']['mae'] < baseline_mae * 1.5:
+            print(f"  → STRONG: Decay ratios capture much of the physics!")
+        else:
+            print(f"  → MODERATE: Ratios alone insufficient, need other features")
+
+    # Component importance
+    if 'z_component_only' in results:
+        z_impact = results['z_component_only']['mae'] - baseline_mae
+        print(f"\nZ-Component (Vertical):")
+        print(f"  • MAE with ONLY Z: {results['z_component_only']['mae']:.2f} m")
+        print(f"  • Impact: +{z_impact:.2f} m vs full model")
+        if results['z_component_only']['mae'] < baseline_mae * 1.3:
+            print(f"  → Z-component dominates signal")
+        else:
+            print(f"  → Multi-component information important")
 
     # Save results
     results_df = pd.DataFrame([
         {
             'feature_set': k,
             'n_features': v['n_features'],
-            'mae': v['mae'],
-            'vs_full_percent': ((v['mae'] - baseline_mae) / baseline_mae * 100) if baseline_mae > 0 else 0,
+            'val_mae': v.get('val_mae', 0),
+            'test_mae': v['mae'],
+            'mae_diff_vs_full': v['mae'] - baseline_mae,
+            'mae_diff_percent': ((v['mae'] - baseline_mae) / baseline_mae * 100) if baseline_mae > 0 else 0,
             'description': v['description']
         }
         for k, v in results.items()
     ])
+    # Sort by test_mae
+    results_df = results_df.sort_values('test_mae')
     results_df.to_csv('feature_ablation_results.csv', index=False)
     print(f"\n✓ Results saved to 'feature_ablation_results.csv'")
 
+    print("\n" + "="*70)
+    print("NOTE: This study uses the FULL model architecture for fair comparison.")
+    print("Training takes longer but results are meaningful. Lower MAE = better.")
     print("="*70)
 
 
