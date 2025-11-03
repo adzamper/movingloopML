@@ -665,12 +665,87 @@ def analyze_by_configuration(y_true, y_pred, metadata_list):
     return config_stats
 
 
+def analyze_within_config_noise_sensitivity(y_true, y_pred, metadata_list):
+    """
+    Analyze model robustness using natural noise variations in the data.
+
+    IMPORTANT: This assumes files like "0moffset1", "0moffset2", ..., "0moffset20"
+    are the SAME survey configuration with different noise realizations.
+
+    This is the CORRECT way to test noise robustness - using real measurement noise
+    variations, not synthetic noise added after signal processing.
+
+    Parameters:
+    -----------
+    y_true : np.array
+        True target locations
+    y_pred : np.array
+        Predicted locations
+    metadata_list : list
+        List of metadata dicts with 'file_id', 'offset', 'config_type', 'true_location'
+
+    Returns:
+    --------
+    dict : Configuration -> noise sensitivity statistics
+    """
+    # Group predictions by configuration
+    config_predictions = {}
+
+    for i, meta in enumerate(metadata_list):
+        config_key = (meta['true_location'], meta['offset'], meta['config_type'])
+
+        if config_key not in config_predictions:
+            config_predictions[config_key] = {
+                'file_ids': [],
+                'true': [],
+                'pred': [],
+                'errors': []
+            }
+
+        config_predictions[config_key]['file_ids'].append(meta.get('file_id', i))
+        config_predictions[config_key]['true'].append(y_true[i])
+        config_predictions[config_key]['pred'].append(y_pred[i])
+        config_predictions[config_key]['errors'].append(abs(y_pred[i] - y_true[i]))
+
+    # Calculate noise sensitivity for each config
+    noise_sensitivity = {}
+
+    for config_key, data in config_predictions.items():
+        loc, offset, cfg_type = config_key
+        config_name = f"{offset}m_{cfg_type}_at_{loc}m"
+
+        errors = np.array(data['errors'])
+        preds = np.array(data['pred'])
+
+        noise_sensitivity[config_name] = {
+            'n_variations': len(errors),
+            'mean_error': np.mean(errors),
+            'std_error': np.std(errors),  # Variation due to noise!
+            'min_error': np.min(errors),
+            'max_error': np.max(errors),
+            'prediction_std': np.std(preds),  # How much predictions vary with noise
+            'error_range': np.max(errors) - np.min(errors)
+        }
+
+    return noise_sensitivity
+
+
 def test_noise_robustness(models, X_test, y_test, noise_levels=[0.0, 0.05, 0.1, 0.15, 0.2]):
     """
-    Test model robustness by adding Gaussian noise at various levels.
+    ⚠️ DEPRECATED: This function has a fundamental flaw!
 
-    This helps identify overfitting - a robust model should degrade gracefully
-    with increasing noise, while an overfit model will collapse.
+    PROBLEM:
+    - Adds noise to PROCESSED features (after log transform, filtering, scaling)
+    - Real measurement noise affects RAW TEM channels BEFORE processing
+    - Savitzky-Golay filter smooths noise, so adding after ≠ adding before
+    - Results are misleading (model appears too robust)
+
+    USE INSTEAD: analyze_within_config_noise_sensitivity()
+    - Uses natural noise variations in your data (file1, file2, ..., file20)
+    - Tests real measurement noise, not synthetic feature noise
+    - Provides accurate noise robustness assessment
+
+    This function kept for backward compatibility only.
 
     Parameters:
     -----------
@@ -1026,25 +1101,42 @@ if __name__ == '__main__':
     print(f"\n  Best Configuration: {best_config[0]} (MAE: {best_config[1]['mae']:.2f} m)")
 
     # -------------------------------------------------------------------------
-    # Noise Robustness Testing
+    # Noise Sensitivity Analysis (using natural noise variations)
     # -------------------------------------------------------------------------
-    print(f"\n  Testing noise robustness...")
-    noise_levels = [0.0, 0.05, 0.1, 0.15, 0.2, 0.25]
-    noise_results = test_noise_robustness(models, X_test, y_test, noise_levels)
+    print(f"\n  Analyzing noise sensitivity using natural variations in test data...")
+    print(f"  (Files like '0moffset1' and '0moffset2' are same config with different noise)")
 
-    print(f"\n  Noise Robustness Results:")
-    print(f"    Noise Level | MAE (m)")
-    print(f"    {'-'*25}")
-    for noise_level, mae_val in noise_results.items():
-        print(f"    {noise_level*100:5.1f}%      | {mae_val:6.2f}")
+    noise_sensitivity = analyze_within_config_noise_sensitivity(y_test, mean_preds, metadata_test)
 
-    degradation = (noise_results[0.2] - noise_results[0.0]) / noise_results[0.0] * 100
-    if degradation < 50:
-        print(f"\n  ✓ Model is ROBUST (20% noise → {degradation:.1f}% error increase)")
-    elif degradation < 100:
-        print(f"\n  ⚠ Model shows MODERATE sensitivity (20% noise → {degradation:.1f}% error increase)")
+    print(f"\n  Noise Sensitivity by Configuration:")
+    print(f"  {'Configuration':<30} {'N':<5} {'Mean Error':<12} {'Std (noise)':<12} {'Range':<12}")
+    print(f"  {'-'*75}")
+
+    for config_name in sorted(noise_sensitivity.keys()):
+        stats = noise_sensitivity[config_name]
+        print(f"  {config_name:<30} {stats['n_variations']:<5} "
+              f"{stats['mean_error']:<12.1f} {stats['std_error']:<12.1f} "
+              f"{stats['error_range']:<12.1f}")
+
+    # Calculate overall noise sensitivity
+    all_stds = [stats['std_error'] for stats in noise_sensitivity.values()]
+    all_ranges = [stats['error_range'] for stats in noise_sensitivity.values()]
+    mean_std = np.mean(all_stds)
+    mean_range = np.mean(all_ranges)
+
+    print(f"\n  Overall Noise Sensitivity:")
+    print(f"    Average error std across noise variations: {mean_std:.1f} m")
+    print(f"    Average error range (max - min): {mean_range:.1f} m")
+
+    if mean_std < 20:
+        print(f"  ✓ Model is ROBUST to measurement noise (low variation across noise realizations)")
+    elif mean_std < 50:
+        print(f"  ⚠ Model shows MODERATE noise sensitivity")
     else:
-        print(f"\n  ✗ Model may be OVERFITTING (20% noise → {degradation:.1f}% error increase)")
+        print(f"  ✗ Model is HIGHLY sensitive to noise (predictions vary significantly)")
+
+    print(f"\n  NOTE: This uses REAL measurement noise from your 20 file variations per config,")
+    print(f"  not synthetic noise added after signal processing. This is the correct metric!")
 
     # -------------------------------------------------------------------------
     # Visualization
@@ -1116,17 +1208,23 @@ if __name__ == '__main__':
     ax5.tick_params(axis='x', rotation=45, labelsize=8)
     ax5.grid(True, alpha=0.3, axis='y')
 
-    # 6. Noise Robustness
+    # 6. Noise Sensitivity (variation across noise realizations)
     ax6 = fig.add_subplot(gs[2, 0])
-    noise_x = [n*100 for n in noise_levels]
-    noise_y = [noise_results[n] for n in noise_levels]
-    ax6.plot(noise_x, noise_y, 'o-', linewidth=2, markersize=8, color='red')
-    ax6.axhline(mae, color='green', linestyle='--', linewidth=1.5, alpha=0.7, label='Baseline MAE')
-    ax6.set_xlabel('Noise Level (%)', fontsize=10)
-    ax6.set_ylabel('Mean Absolute Error (m)', fontsize=10)
-    ax6.set_title('Noise Robustness Test', fontsize=11, fontweight='bold')
+    config_names_short = [name.replace('_at_1700m', '').replace('.0', '')
+                         for name in sorted(noise_sensitivity.keys())]
+    noise_stds = [noise_sensitivity[name]['std_error'] for name in sorted(noise_sensitivity.keys())]
+    noise_ranges = [noise_sensitivity[name]['error_range'] for name in sorted(noise_sensitivity.keys())]
+
+    x_pos = np.arange(len(config_names_short))
+    ax6.bar(x_pos, noise_stds, alpha=0.7, color='steelblue', label='Std Dev')
+    ax6.set_ylabel('Error Std across noise variations (m)', fontsize=10)
+    ax6.set_title('Noise Sensitivity by Config', fontsize=11, fontweight='bold')
+    ax6.set_xticks(x_pos)
+    ax6.set_xticklabels(config_names_short, rotation=45, ha='right', fontsize=8)
     ax6.legend()
-    ax6.grid(True, alpha=0.3)
+    ax6.grid(True, alpha=0.3, axis='y')
+    ax6.axhline(mean_std, color='red', linestyle='--', linewidth=1.5,
+                alpha=0.7, label=f'Mean: {mean_std:.1f}m')
 
     # 7. Prediction Probability Curves for Each Target Location
     ax7 = fig.add_subplot(gs[2, 1:])
@@ -1193,12 +1291,21 @@ if __name__ == '__main__':
     ])
     config_perf_df.to_csv('configuration_performance.csv', index=False)
 
-    # 3. Noise robustness CSV
-    noise_df = pd.DataFrame([
-        {'noise_level_percent': n*100, 'mae': noise_results[n]}
-        for n in noise_levels
+    # 3. Noise sensitivity CSV (variation across noise realizations)
+    noise_sens_df = pd.DataFrame([
+        {
+            'configuration': config_name,
+            'n_variations': stats['n_variations'],
+            'mean_error': stats['mean_error'],
+            'std_error': stats['std_error'],
+            'min_error': stats['min_error'],
+            'max_error': stats['max_error'],
+            'error_range': stats['error_range'],
+            'prediction_std': stats['prediction_std']
+        }
+        for config_name, stats in noise_sensitivity.items()
     ])
-    noise_df.to_csv('noise_robustness.csv', index=False)
+    noise_sens_df.to_csv('noise_sensitivity.csv', index=False)
 
     # 4. Individual model predictions (for ensemble analysis)
     individual_preds_df = pd.DataFrame(test_preds.T, columns=[f'model_{i}' for i in range(N_ENSEMBLE)])
@@ -1241,13 +1348,13 @@ if __name__ == '__main__':
     print(f"    CSV Data (for custom analysis):")
     print(f"      • predictions_results.csv")
     print(f"      • configuration_performance.csv")
-    print(f"      • noise_robustness.csv")
+    print(f"      • noise_sensitivity.csv (variation across noise realizations)")
     print(f"      • ensemble_predictions.csv")
     print(f"      • detailed_test_results.csv")
     print(f"\n  Performance Summary:")
     print(f"    • Test MAE: {mae:.2f} m")
     print(f"    • Best configuration: {best_config[0]} (MAE: {best_config[1]['mae']:.2f} m)")
-    print(f"    • Noise robustness: {degradation:.1f}% error increase at 20% noise")
+    print(f"    • Noise sensitivity: {mean_std:.1f} m std across noise realizations")
     print(f"\n  Next steps:")
     print(f"    • Run 'python visualize_results.py' for detailed profile plots")
     print(f"    • Run 'python predict_single.py <path_to_tem_file>' for single predictions")
