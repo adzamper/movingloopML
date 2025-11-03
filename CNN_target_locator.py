@@ -42,6 +42,11 @@ MAX_STATIONS = 101  # Maximum number of measurement stations
 STATION_SPACING = 50.0  # Distance between stations in meters
 RANDOM_SEED = 42  # For reproducibility
 
+# Feature engineering mode
+# Based on ablation study findings: gradients hurt performance (-22%)!
+FEATURE_MODE = 'optimized'  # Options: 'optimized' (no gradients), 'full' (with gradients), 'raw' (raw channels)
+USE_GRADIENTS = False  # Set to True to include gradients (NOT recommended - degrades performance)
+
 # Data augmentation settings
 AUGMENTATION_ENABLED = True
 AUGMENTATION_NOISE_LEVEL = 0.05  # 5% noise
@@ -129,14 +134,24 @@ def parse_tem_file(file_path):
 
 def create_feature_profile(df, metadata):
     """
-    Create feature profile from TEM data with enhanced feature engineering.
+    Create feature profile from TEM data with optimized feature engineering.
+
+    ABLATION STUDY FINDINGS:
+    - Spatial gradients HURT performance (-22%) → Removed by default
+    - Background removal (residuals) HELPS (+24% if removed) → Kept
+    - Raw channels may work better than hand-crafted features → Use FEATURE_MODE='raw'
+
+    Feature modes:
+    - 'optimized': Time sums + ratios + residuals (NO gradients) ← RECOMMENDED
+    - 'full': All features including gradients (for comparison)
+    - 'raw': Raw CH1-CH20 channels with residuals (modern approach)
 
     This function extracts spatial features from TEM survey data including:
-    - Early/late time channel summations
+    - Early/mid/late time channel summations
     - Component ratios and total field amplitude
-    - Background-removed residuals (anomaly detection)
-    - Spatial gradients
+    - Background-removed residuals (critical for anomaly detection)
     - Anomaly strength metrics
+    - [OPTIONAL] Spatial gradients (disabled by default - degrades performance)
 
     Parameters:
     -----------
@@ -241,8 +256,12 @@ def create_feature_profile(df, metadata):
             pivoted_df[f'{col}_residual'] = 0
 
     # Calculate spatial gradients (rate of change between stations)
-    grad_df = pivoted_df[base_features].diff().fillna(0)
-    grad_df.columns = [f'{c}_grad' for c in base_features]
+    # NOTE: Ablation study showed gradients DEGRADE performance by 22%!
+    # Only included if explicitly enabled for comparison purposes
+    grad_df = None
+    if USE_GRADIENTS:
+        grad_df = pivoted_df[base_features].diff().fillna(0)
+        grad_df.columns = [f'{c}_grad' for c in base_features]
 
     # Add anomaly strength metrics
     residual_cols = [c for c in pivoted_df.columns if 'residual' in c]
@@ -253,13 +272,19 @@ def create_feature_profile(df, metadata):
         pivoted_df['anomaly_energy'] = np.sqrt(
             (pivoted_df[residual_cols]**2).sum(axis=1))
 
-    # Combine all features
-    final_features_df = pd.concat([
+    # Combine all features (conditionally include gradients)
+    combine_list = [
         pivoted_df[['STATION'] + base_features],
-        pivoted_df[residual_cols],
-        grad_df,
-        pivoted_df[['anomaly_peak', 'anomaly_energy']] if 'anomaly_peak' in pivoted_df else pd.DataFrame()
-    ], axis=1)
+        pivoted_df[residual_cols]
+    ]
+
+    if grad_df is not None:
+        combine_list.append(grad_df)
+
+    if 'anomaly_peak' in pivoted_df:
+        combine_list.append(pivoted_df[['anomaly_peak', 'anomaly_energy']])
+
+    final_features_df = pd.concat(combine_list, axis=1)
 
     # Add configuration metadata as features
     final_features_df['offset'] = metadata['offset']
@@ -276,6 +301,98 @@ def create_feature_profile(df, metadata):
             full_profile[station_idx, :] = row[feature_cols].values
 
     return full_profile
+
+def create_raw_channel_profile(df, metadata):
+    """
+    Create feature profile using RAW time channels (modern deep learning approach).
+
+    Instead of hand-crafting features (early/mid/late sums, ratios), this function
+    feeds the raw CH1-CH20 data directly to the CNN, letting it learn optimal features.
+
+    ADVANTAGES:
+    - No assumptions about which time windows matter
+    - CNN can discover patterns we didn't think of
+    - Modern best practice (see: image nets use raw pixels, not hand-crafted features)
+
+    PROCESSING:
+    - Log transform (handles exponential decay)
+    - Background removal (residuals) - CRITICAL from ablation study
+    - Raw channels per component (X, Y, Z)
+
+    Parameters:
+    -----------
+    df : DataFrame
+        TEM survey data with columns: STATION, COMPONENT, CH1-CH20
+    metadata : dict
+        Metadata including 'offset', 'config_type', etc.
+
+    Returns:
+    --------
+    np.array : Feature profile of shape (MAX_STATIONS, n_features)
+        Features = 20 channels × 3 components × 2 (raw + residual) + metadata = 122 features
+    """
+    all_channel_cols = [f'CH{i}' for i in range(1, 21)]
+
+    # Normalize
+    max_val = df[all_channel_cols].abs().max().max()
+    if max_val > 0:
+        for col in all_channel_cols:
+            df[col] /= max_val
+
+    # Log transform (handles exponential decay)
+    for col in all_channel_cols:
+        if col in df.columns:
+            df[col] = np.sign(df[col]) * np.log1p(np.abs(df[col]))
+
+    # Organize by station and component
+    station_features = []
+    for station in sorted(df['STATION'].unique()):
+        station_data = df[df['STATION'] == station]
+
+        features = {}
+        for component in ['X', 'Y', 'Z']:
+            comp_data = station_data[station_data['COMPONENT'] == component]
+            if not comp_data.empty:
+                # Raw channels
+                for ch in all_channel_cols:
+                    features[f'{ch}_{component}'] = comp_data[ch].iloc[0]
+
+        station_features.append({'STATION': station, **features})
+
+    if not station_features:
+        return None
+
+    feature_df = pd.DataFrame(station_features)
+
+    # Get channel features (all except STATION)
+    channel_features = [col for col in feature_df.columns if col != 'STATION']
+
+    # Background removal (residuals) - CRITICAL for performance
+    for col in channel_features:
+        if len(feature_df[col]) >= 51:
+            try:
+                background = savgol_filter(feature_df[col], window_length=51, polyorder=3)
+                feature_df[f'{col}_residual'] = feature_df[col] - background
+            except:
+                feature_df[f'{col}_residual'] = 0
+        else:
+            feature_df[f'{col}_residual'] = 0
+
+    # Add metadata
+    feature_df['offset'] = metadata['offset']
+    feature_df['config_type_encoded'] = 1 if metadata['config_type'] == 'trailing' else 0
+
+    # Create spatial profile
+    full_profile = np.zeros((MAX_STATIONS, len(feature_df.columns) - 1))
+    feature_cols = [col for col in feature_df.columns if col != 'STATION']
+
+    for _, row in feature_df.iterrows():
+        station_idx = int(row['STATION'] / STATION_SPACING)
+        if 0 <= station_idx < MAX_STATIONS:
+            full_profile[station_idx, :] = row[feature_cols].values
+
+    return full_profile
+
 
 def augment_profile(profile, noise_level=0.05):
     """
@@ -345,7 +462,12 @@ def load_all_data(base_dir):
             for fname in files:
                 df, metadata = parse_tem_file(os.path.join(folder_path, fname))
                 if df is not None and metadata is not None:
-                    profile = create_feature_profile(df, metadata)
+                    # Choose feature extraction method based on FEATURE_MODE
+                    if FEATURE_MODE == 'raw':
+                        profile = create_raw_channel_profile(df, metadata)
+                    else:
+                        profile = create_feature_profile(df, metadata)
+
                     if profile is not None:
                         all_profiles.append(profile)
                         all_labels.append(label)
