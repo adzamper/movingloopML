@@ -83,11 +83,27 @@ The model reports:
 Edit these parameters in `CNN_target_locator.py`:
 
 ```python
-DATA_DIRECTORY = "."              # Path to data folders
-N_ENSEMBLE = 3                    # Number of ensemble models
-AUGMENTATION_ENABLED = True       # Enable data augmentation
-AUGMENTATION_NOISE_LEVEL = 0.05   # 5% noise augmentation
+DATA_DIRECTORY = "."                    # Path to data folders
+N_ENSEMBLE = 3                          # Number of ensemble models
+AUGMENTATION_ENABLED = True             # Enable data augmentation
+AUGMENTATION_NOISE_LEVEL = 0.05         # 5% noise augmentation
+
+# Feature engineering mode (based on ablation study findings)
+FEATURE_MODE = 'optimized'              # 'optimized' (no gradients - RECOMMENDED)
+                                        # 'full' (with gradients - for comparison)
+                                        # 'raw' (raw CH1-CH20 channels)
+USE_GRADIENTS = False                   # Set True to include gradients (NOT recommended)
 ```
+
+### ⚠️ Important: Ablation Study Findings
+
+Our feature importance testing revealed **spatial gradients actually degrade performance by 22%**:
+- **With gradients** (full features): 49.14m MAE
+- **Without gradients** (optimized): 38.20m MAE ✅ **22% better!**
+
+**Recommendation:** Use `FEATURE_MODE = 'optimized'` (default) which excludes gradients.
+
+**Why this matters:** Traditional geophysics assumed spatial derivatives help edge detection, but the CNN already learns these patterns internally. Hand-crafted gradients add noise, not signal.
 
 ## Additional Tools
 
@@ -133,14 +149,16 @@ python feature_ablation_study.py
 ```
 
 Tests 8 different feature combinations:
-- **Full**: All ~100 features (baseline)
+- **Full**: All ~100 features (baseline - 49.14m MAE)
+- **No Gradients**: Excluding spatial derivatives (38.20m MAE) ✅ **BEST - 22% improvement!**
 - **Minimal**: Only late_sum_Z_residual
 - **Physics Core**: Decay ratios + key residuals
-- **No Residuals**: Raw features only
-- **No Gradients**: Excluding spatial derivatives
+- **No Residuals**: Raw features only (60.85m MAE - 24% worse)
 - **Late Only**: Only late-time channels
 - **Ratios Only**: Only decay ratios
 - **Z Component Only**: Only vertical component
+
+**Key Finding:** Spatial gradients are harmful, not helpful! The main script now excludes them by default.
 
 Outputs:
 - `feature_ablation_results.csv` - Performance comparison
