@@ -344,47 +344,70 @@ def build_model(input_shape):
 
 def split_by_groups(X, y, metadata, test_ratio=0.2, val_ratio=0.15):
     """
-    Split data using group-based splitting to prevent data leakage.
+    Split data by LOCATION to prevent data leakage and test true generalization.
 
-    Critical Insight:
-    -----------------
-    Files like "0moffset1" and "0moffset2" are the SAME survey with different
-    noise realizations. If we randomly split, the model sees the pattern in
-    training and "predicts" it perfectly in test (data leakage!).
+    Critical Insights:
+    ------------------
+    1. NOISE VARIATION LEAKAGE:
+       Files like "0moffset1" and "0moffset2" are the SAME survey with different
+       noise. We must keep all noise variations together.
+
+    2. LOCATION-BASED DEPLOYMENT:
+       Real deployment scenario:
+       - Train at survey sites A, B, C (all configs)
+       - Deploy at NEW site D (all configs)
+
+       We should NOT test cross-config generalization (proven to fail with 2212m MAE).
+       We SHOULD test location generalization.
 
     Solution:
     ---------
-    Group by (location, config_type, offset) so all noise variations of the
-    same survey stay together in one split.
+    Group by LOCATION only. All configs at a location stay together.
 
-    This tests: "Can the model generalize to NEW survey configurations at
-    NEW locations?" (the real deployment scenario)
+    This ensures:
+    - All noise variations of same survey stay together (prevents leakage)
+    - All configs present in both train and test (at different locations)
+    - Tests: "Can model work at a NEW survey site?" (realistic scenario)
+
+    Example:
+    --------
+    Train: All configs at [1700m, 1900m, 2100m, 2300m, 2500m]
+    Val:   All configs at [2700m, 2900m]
+    Test:  All configs at [3100m, 3300m]
+
+    Each location has all 5 configs × 20 noise variations = 100 files.
     """
-    # Create groups
-    config_groups = {}
+    # Group by LOCATION only (all configs and noise variations stay together)
+    location_groups = {}
     for i, meta in enumerate(metadata):
-        group_key = (meta['true_location'], meta['config_type'], meta['offset'])
-        if group_key not in config_groups:
-            config_groups[group_key] = []
-        config_groups[group_key].append(i)
+        loc = meta['true_location']
+        if loc not in location_groups:
+            location_groups[loc] = []
+        location_groups[loc].append(i)
 
-    # Shuffle groups
-    group_keys = list(config_groups.keys())
-    np.random.shuffle(group_keys)
+    # Shuffle locations
+    locations = sorted(location_groups.keys())
+    np.random.shuffle(locations)
 
-    # Assign to splits
-    n_groups = len(group_keys)
-    n_test = max(1, int(n_groups * test_ratio))
-    n_val = max(1, int(n_groups * val_ratio))
+    # Assign locations to splits
+    n_locs = len(locations)
+    n_test_locs = max(1, int(n_locs * test_ratio))
+    n_val_locs = max(1, int(n_locs * val_ratio))
 
-    test_groups = group_keys[:n_test]
-    val_groups = group_keys[n_test:n_test+n_val]
-    train_groups = group_keys[n_test+n_val:]
+    test_locs = locations[:n_test_locs]
+    val_locs = locations[n_test_locs:n_test_locs+n_val_locs]
+    train_locs = locations[n_test_locs+n_val_locs:]
 
-    # Extract indices
-    train_idx = [i for g in train_groups for i in config_groups[g]]
-    val_idx = [i for g in val_groups for i in config_groups[g]]
-    test_idx = [i for g in test_groups for i in config_groups[g]]
+    # Print split for transparency
+    print(f"\n  Location-based split:")
+    print(f"    Train locations ({len(train_locs)}): {sorted(train_locs)}")
+    print(f"    Val locations ({len(val_locs)}):   {sorted(val_locs)}")
+    print(f"    Test locations ({len(test_locs)}):  {sorted(test_locs)}")
+
+    # Extract all samples from each location group
+    train_idx = [i for loc in train_locs for i in location_groups[loc]]
+    val_idx = [i for loc in val_locs for i in location_groups[loc]]
+    test_idx = [i for loc in test_locs for i in location_groups[loc]]
 
     return (X[train_idx], y[train_idx], [metadata[i] for i in train_idx],
             X[val_idx], y[val_idx], [metadata[i] for i in val_idx],

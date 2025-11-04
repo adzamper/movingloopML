@@ -318,28 +318,50 @@ Test:  1700/0moffset2.tem  ❌ LEAKAGE!
 
 The model learns the pattern from noise variation #1, then "predicts" variation #2 perfectly. This gives artificially good results that don't reflect real-world performance.
 
-### Solution: Group-Based Splitting
+### Solution: Location-Based Splitting
 
-**Approach:** Group files by `(location, config_type, offset)`, then split groups (not individual files).
+**Approach:** Group files by **LOCATION only**, then split locations (not individual files).
 
+**Critical insight:** We should test location generalization, NOT config generalization.
+
+**Why?**
+- Different configs (0m vs 500m offset) have fundamentally different physics
+- Ablation studies proved cross-config generalization fails (2212m MAE)
+- Real deployment: Train at sites A, B, C → Deploy at NEW site D
+- At each site, we measure ALL configs
+
+**Implementation:**
 ```
-Group A: ALL 0moffset files at 1700m (variations 1-20)
-Group B: ALL 500moffset files at 1900m (variations 1-20)
+Location Groups:
+- 1700m: ALL configs (0m, 500m, 800m, 1000m, trailing) × 20 noise variations = 100 files
+- 1900m: ALL configs × 20 noise variations = 100 files
+- 2100m: ALL configs × 20 noise variations = 100 files
 ...
 
-Train: Groups A, C, E, G, ...
-Test:  Groups B, D, F, H, ...
+Split by location:
+Train: Locations [1700, 1900, 2100, 2300, 2500] (all their files)
+Val:   Locations [2700, 2900] (all their files)
+Test:  Locations [3100, 3300] (all their files)
 ```
 
-Now each group's **entire set** of noise variations stays together.
+**What this ensures:**
+1. ✓ All noise variations of a survey stay together (prevents leakage)
+2. ✓ All configs present in both train and test (at different locations)
+3. ✓ Train and test locations completely separate
+4. ✓ Tests realistic scenario: "Does model work at NEW survey sites?"
 
-**What this tests:** "Can the model generalize to **unseen survey configurations at unseen locations**?" (The real deployment scenario)
+**What this tests:** "Can the model generalize to **unseen locations**?" (The real deployment scenario)
 
 ### Split Ratios
 
-- **Train:** 60% of groups (~540 samples)
-- **Validation:** 20% of groups (~180 samples) - for monitoring during training
-- **Test:** 20% of groups (~180 samples) - final performance evaluation
+- **Train:** 60% of locations (e.g., 5 locations = ~500 samples)
+- **Validation:** 15% of locations (e.g., 2 locations = ~200 samples) - for monitoring during training
+- **Test:** 20% of locations (e.g., 2 locations = ~200 samples) - final performance evaluation
+
+**Example with 9 locations:**
+- Train: 5-6 locations (500-600 samples)
+- Val: 1-2 locations (100-200 samples)
+- Test: 2 locations (200 samples)
 
 ### Ensemble Training
 
