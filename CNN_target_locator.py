@@ -820,74 +820,55 @@ if __name__ == '__main__':
         print(f"  {config}: {count} samples")
 
     # -------------------------------------------------------------------------
-    # Split data: Group-based splitting to prevent data leakage
+    # Split data: Location-based splitting to prevent data leakage
     # -------------------------------------------------------------------------
-    # CRITICAL: Files like "0moffset1" and "0moffset2" are the SAME survey configuration
-    # with different noise realizations. They must stay in the same split!
+    # CRITICAL INSIGHTS:
+    # 1. Files like "0moffset1" and "0moffset2" are the SAME survey with different
+    #    noise realizations. They must stay together!
     #
-    # We group by (location, config_type, offset) so all noise variations stay together.
-    # This tests: "Can the model generalize to UNSEEN survey configurations?"
+    # 2. Different configs (0m vs 500m) have different physics. Cross-config
+    #    generalization fails (2212m MAE from ablation study).
+    #
+    # 3. Real deployment: Train at sites A, B, C → Deploy at NEW site D
+    #    At each site, we measure ALL configs.
+    #
+    # SOLUTION: Group by LOCATION only. All configs at a location stay together.
+    # This tests: "Can the model work at a NEW survey site?"
     # -------------------------------------------------------------------------
-    print(f"\n[2/6] Splitting data by configuration groups (prevents noise variation leakage)")
+    print(f"\n[2/6] Splitting data by LOCATION (prevents leakage, tests site generalization)")
     print("-" * 70)
 
-    # Create configuration groups (each group = all noise variations of one survey config)
-    config_groups = {}
+    # Group by LOCATION only (all configs and noise variations stay together)
+    location_groups = {}
     for i, meta in enumerate(metadata):
-        # Group key: (location, config_type, offset)
-        # All files with same location+config+offset are treated as one group
-        group_key = (meta['true_location'], meta['config_type'], meta['offset'])
-        if group_key not in config_groups:
-            config_groups[group_key] = []
-        config_groups[group_key].append(i)
+        loc = meta['true_location']
+        if loc not in location_groups:
+            location_groups[loc] = []
+        location_groups[loc].append(i)
 
-    print(f"  Found {len(config_groups)} unique configuration groups (location+config+offset)")
-    print(f"  Group composition:")
-    for group_key, indices in sorted(config_groups.items()):
-        loc, cfg_type, offset = group_key
-        print(f"    Location={loc}m, {offset}m_{cfg_type}: {len(indices)} noise variations")
+    print(f"  Found {len(location_groups)} unique locations")
+    print(f"  Samples per location:")
+    for loc in sorted(location_groups.keys()):
+        print(f"    {loc}m: {len(location_groups[loc])} samples (all configs × noise variations)")
 
-    # Split groups (not individual samples!)
-    # We'll manually assign groups to ensure good distribution
-    group_keys = list(config_groups.keys())
+    # Shuffle and split locations
+    locations = sorted(location_groups.keys())
     np.random.seed(RANDOM_SEED)
-    np.random.shuffle(group_keys)
+    np.random.shuffle(locations)
 
-    # Assign groups to splits (aim for 60% train, 20% val, 20% test by sample count)
-    train_groups = []
-    val_groups = []
-    test_groups = []
+    # Assign locations to splits (60% train, 15% val, 20% test)
+    n_locs = len(locations)
+    n_test_locs = max(1, int(n_locs * 0.2))
+    n_val_locs = max(1, int(n_locs * 0.15))
 
-    train_count = 0
-    val_count = 0
-    test_count = 0
-    total_samples = len(y)
+    test_locs = locations[:n_test_locs]
+    val_locs = locations[n_test_locs:n_test_locs+n_val_locs]
+    train_locs = locations[n_test_locs+n_val_locs:]
 
-    for group_key in group_keys:
-        group_size = len(config_groups[group_key])
-
-        # Greedy assignment to balance splits
-        if train_count < 0.6 * total_samples:
-            train_groups.append(group_key)
-            train_count += group_size
-        elif val_count < 0.2 * total_samples:
-            val_groups.append(group_key)
-            val_count += group_size
-        else:
-            test_groups.append(group_key)
-            test_count += group_size
-
-    # Create index lists for each split
-    train_indices = []
-    val_indices = []
-    test_indices = []
-
-    for group_key in train_groups:
-        train_indices.extend(config_groups[group_key])
-    for group_key in val_groups:
-        val_indices.extend(config_groups[group_key])
-    for group_key in test_groups:
-        test_indices.extend(config_groups[group_key])
+    # Extract all samples from each location group
+    train_indices = [i for loc in train_locs for i in location_groups[loc]]
+    val_indices = [i for loc in val_locs for i in location_groups[loc]]
+    test_indices = [i for loc in test_locs for i in location_groups[loc]]
 
     # Extract data for each split
     X_train_full = X[train_indices]
@@ -903,22 +884,15 @@ if __name__ == '__main__':
     metadata_test = [metadata[i] for i in test_indices]
 
     print(f"\n  Split allocation:")
-    print(f"    Training:   {len(train_groups)} groups → {len(X_train_full)} samples")
-    for group_key in train_groups:
-        loc, cfg_type, offset = group_key
-        print(f"      - {offset}m_{cfg_type} at {loc}m ({len(config_groups[group_key])} files)")
+    print(f"    Training:   {len(train_locs)} locations → {len(X_train_full)} samples")
+    print(f"      Locations: {sorted(train_locs)}")
+    print(f"    Validation: {len(val_locs)} locations → {len(X_val)} samples")
+    print(f"      Locations: {sorted(val_locs)}")
+    print(f"    Test:       {len(test_locs)} locations → {len(X_test)} samples")
+    print(f"      Locations: {sorted(test_locs)}")
 
-    print(f"    Validation: {len(val_groups)} groups → {len(X_val)} samples")
-    for group_key in val_groups:
-        loc, cfg_type, offset = group_key
-        print(f"      - {offset}m_{cfg_type} at {loc}m ({len(config_groups[group_key])} files)")
-
-    print(f"    Test:       {len(test_groups)} groups → {len(X_test)} samples")
-    for group_key in test_groups:
-        loc, cfg_type, offset = group_key
-        print(f"      - {offset}m_{cfg_type} at {loc}m ({len(config_groups[group_key])} files)")
-
-    print(f"\n  ✓ No noise variation leakage: Each config group stays in one split only")
+    print(f"\n  ✓ Location-based split: All configs at each location stay together")
+    print(f"  ✓ Tests: Can model work at NEW survey sites?")
 
     # -------------------------------------------------------------------------
     # Apply data augmentation to TRAINING SET ONLY (prevent data leakage)
