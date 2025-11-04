@@ -449,6 +449,28 @@ if __name__ == '__main__':
     data_path = os.path.join(script_dir, DATA_DIRECTORY)
 
     X, y, metadata = load_all_data(data_path)
+
+    # Check if data was loaded
+    if len(X) == 0:
+        print("\n" + "!"*80)
+        print("ERROR: No data found!")
+        print("!"*80)
+        print(f"\nSearched in: {data_path}")
+        print("\nExpected directory structure:")
+        print("  your_directory/")
+        print("    1700/")
+        print("      0moffset1.tem, 0moffset2.tem, ...")
+        print("    1900/")
+        print("      0moffset1.tem, ...")
+        print("    ...")
+        print("\nPlease ensure:")
+        print("  1. Run script from directory containing numbered location folders")
+        print("  2. Or set DATA_DIRECTORY to path containing location folders")
+        print("  3. Location folders should be numeric (1700, 1900, 2100, etc.)")
+        print("  4. Each folder contains .tem files")
+        print("="*80)
+        exit(1)
+
     print(f"\nData shape: {X.shape}")
     print(f"  {X.shape[0]} samples")
     print(f"  {X.shape[1]} stations (spatial dimension)")
